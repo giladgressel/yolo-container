@@ -43,7 +43,7 @@
     "source=${localEnv:HOME}/.agents/skills,target=/home/node/.agents/skills,type=bind,readonly",
     "source=${localEnv:HOME}/.claude/statusline-command.sh,target=/home/node/.claude/statusline-command.sh,type=bind,readonly",
     "source=${localEnv:HOME}/.claude.json,target=/yolo/host-claude.json,type=bind,readonly",
-    "source=${localEnv:HOME}/.dotfiles/starship.toml,target=/home/node/.config/starship.toml,type=bind,readonly",
+    "source=${localEnv:HOME}/.config/starship.toml,target=/home/node/.config/starship.toml,type=bind,readonly",
     "source=${localEnv:HOME}/.netrc,target=/home/node/.netrc,type=bind,readonly",
     "source=${localEnv:HOME}/.gitconfig,target=/home/node/.gitconfig,type=bind,readonly"
   ],

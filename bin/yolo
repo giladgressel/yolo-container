@@ -55,7 +55,19 @@ args=(
 )
 
 # Host config read-only (CLAUDE.md, settings, skills, statusline, starship, netrc, gitconfig)
+# Each mount is conditional on the host file existing — missing files are silently skipped,
+# so others can fork this repo without editing the list.
 add_ro() { [ -e "$1" ] && args+=(-v "$1:$2:ro"); }
+add_ro_first() {
+  # First candidate that exists wins; lets us prefer standard paths and fall back to dotfiles layouts.
+  local target="$1"; shift
+  for candidate in "$@"; do
+    if [ -e "$candidate" ]; then
+      args+=(-v "$candidate:$target:ro")
+      return
+    fi
+  done
+}
 add_ro "$HOME/.claude/CLAUDE.md"             /home/node/.claude/CLAUDE.md
 add_ro "$HOME/.claude/settings.json"         /home/node/.claude/settings.json
 add_ro "$HOME/.claude/settings.local.json"   /home/node/.claude/settings.local.json
@@ -63,7 +75,9 @@ add_ro "$HOME/.claude/skills"                /home/node/.claude/skills
 add_ro "$HOME/.agents/skills"                /home/node/.agents/skills
 add_ro "$HOME/.claude/statusline-command.sh" /home/node/.claude/statusline-command.sh
 add_ro "$HOME/.claude.json"                  /yolo/host-claude.json
-add_ro "$HOME/.dotfiles/starship.toml"       /home/node/.config/starship.toml
+add_ro_first                                 /home/node/.config/starship.toml \
+  "$HOME/.config/starship.toml" \
+  "$HOME/.dotfiles/starship.toml"
 add_ro "$HOME/.netrc"                        /home/node/.netrc
 add_ro "$HOME/.gitconfig"                    /home/node/.gitconfig
 

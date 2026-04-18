@@ -28,6 +28,32 @@ anywhere. The image bakes a `/Users/$HOST_USERNAME/.claude -> ~/.claude` symlink
 so host-style paths in your `settings.json` resolve inside the container;
 `HOST_USERNAME` defaults to `$(whoami)` at build time.
 
+## What the author wanted (and how to opt out)
+
+This setup reflects a few choices that aren't strictly necessary — if you don't
+want them, here's where to cut them.
+
+| Choice | Why it's here | How to opt out |
+|---|---|---|
+| **Starship prompt** baked into the image | So the container prompt matches a starship-using host | Remove the `curl ... starship.rs/install.sh` line in `Dockerfile` and the `starship init zsh` line in the zsh-in-docker args |
+| **MCP sync** from host `~/.claude.json` | So wandb/Gmail/etc MCPs that are configured on the host "just work" in the container (tokens travel) | Delete the `/yolo/host-claude.json` mount + the jq-merge block in `bin/yolo` (and the `postStartCommand` in `devcontainer.json`) |
+| **`WANDB_API_KEY` forwarding** | So the wandb HTTP MCP can authenticate | Remove the `[ -n "${WANDB_API_KEY:-}" ]` block in `bin/yolo` |
+| **`~/.netrc` mount** | So the wandb Python SDK picks up auth inside the container | Remove the `add_ro "$HOME/.netrc" ...` line in `bin/yolo` |
+| **`~/.agents/skills` mount** | A skills dir that lives outside `~/.claude/skills/` via symlinks — nonstandard | `add_ro` already skips missing files; ignore if you don't have it |
+| **`cg` alias** for `claude --dangerously-skip-permissions` | Quick relaunch inside the container | Remove the `-a "alias cg=..."` line in `Dockerfile` |
+
+All the mounts that reference host paths are **conditional on the file
+existing** in the `bin/yolo` wrapper — so forks that don't have e.g. a
+`.netrc` won't see any error, the mount is just silently skipped. The
+`devcontainer.json` mount list is static though (Dev Containers doesn't
+support conditional mounts), so if you use the **Reopen in Container**
+workflow and don't have one of those host files, delete that line from
+`devcontainer.json`.
+
+Starship config is already resilient: `bin/yolo` checks `~/.config/starship.toml`
+first, then falls back to `~/.dotfiles/starship.toml`. If neither exists,
+starship uses its built-in defaults — still a nice prompt.
+
 ## Daily use
 
 ### Terminal (primary)
