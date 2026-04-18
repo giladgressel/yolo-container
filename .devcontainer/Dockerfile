@@ -5,6 +5,12 @@ ENV TZ="$TZ"
 
 ARG CLAUDE_CODE_VERSION=latest
 
+# Rootless podman single-UID mode workaround: apt drops privileges to the
+# `_apt` user (uid 42) which doesn't exist in the namespace when the host
+# lacks subuid/subgid ranges. Tell apt to stay as root. Harmless when
+# proper subuid ranges are configured.
+RUN echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/no-sandbox
+
 # Install basic development tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
   less \
