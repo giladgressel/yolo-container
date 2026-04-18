@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# yolo — run Claude Code in a YOLO container mounted on $PWD.
+#
+# One shared image (yolo-claude:latest) built from this repo's .devcontainer/
+# dir (located automatically relative to this script, so it works when invoked
+# via a symlink in ~/.local/bin). Bind-mounts $PWD to /workspace. Container's
+# .venv is an anonymous volume so it never collides with the host's macOS .venv.
+# uv cache is a shared named volume.
+#
+# Host Claude config (CLAUDE.md, settings, skills, statusline) is mounted
+# READ-ONLY so the sandbox can read your preferences but can't modify them.
+# Changes made inside the container stay inside. To push a change back to the
+# host, copy it out manually (the "over-the-wall" flow).
+#
+# Requires OrbStack (or any Docker) running. Stock macOS ssh-agent forwarded via
+# OrbStack's /run/host-services/ssh-auth.sock.
+
+set -euo pipefail
+
+IMAGE="yolo-claude:latest"
+
+# Resolve this script's real location (follows symlinks, so ~/.local/bin/yolo
+# can symlink into the repo). CTX is the .devcontainer dir next to bin/.
+SCRIPT="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT" ]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT")" && pwd)"
+  SCRIPT="$(readlink "$SCRIPT")"
+  [[ "$SCRIPT" != /* ]] && SCRIPT="$SCRIPT_DIR/$SCRIPT"
+done
+REPO_DIR="$(cd -P "$(dirname "$SCRIPT")/.." && pwd)"
+CTX="$REPO_DIR/.devcontainer"
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "yolo: docker CLI not found. Install OrbStack: brew install orbstack" >&2
+  exit 1
+fi
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "yolo: building $IMAGE (first run — a few minutes)..." >&2
+  docker build --build-arg "HOST_USERNAME=$(whoami)" -t "$IMAGE" "$CTX"
+fi
+
+args=(
+  --rm -it
+  --cap-add=NET_ADMIN --cap-add=NET_RAW
+  --memory=8g --cpus=4
+  -v "$PWD:/workspace" -w /workspace
+  -v /workspace/.venv
+  -v yolo-uv-cache:/home/node/.cache/uv
+  -v yolo-claude-config:/home/node/.claude
+  -v yolo-bashhistory:/commandhistory
+  -v /run/host-services/ssh-auth.sock:/ssh-agent
+  -e SSH_AUTH_SOCK=/ssh-agent
+  -e CLAUDE_CONFIG_DIR=/home/node/.claude
+)
+
+# Host config read-only (CLAUDE.md, settings, skills, statusline, starship, netrc, gitconfig)
+add_ro() { [ -e "$1" ] && args+=(-v "$1:$2:ro"); }
+add_ro "$HOME/.claude/CLAUDE.md"             /home/node/.claude/CLAUDE.md
+add_ro "$HOME/.claude/settings.json"         /home/node/.claude/settings.json
+add_ro "$HOME/.claude/settings.local.json"   /home/node/.claude/settings.local.json
+add_ro "$HOME/.claude/skills"                /home/node/.claude/skills
+add_ro "$HOME/.agents/skills"                /home/node/.agents/skills
+add_ro "$HOME/.claude/statusline-command.sh" /home/node/.claude/statusline-command.sh
+add_ro "$HOME/.claude.json"                  /yolo/host-claude.json
+add_ro "$HOME/.dotfiles/starship.toml"       /home/node/.config/starship.toml
+add_ro "$HOME/.netrc"                        /home/node/.netrc
+add_ro "$HOME/.gitconfig"                    /home/node/.gitconfig
+
+# Forward WANDB_API_KEY so the wandb HTTP MCP can authenticate
+if [ -n "${WANDB_API_KEY:-}" ]; then
+  args+=(-e WANDB_API_KEY)
+fi
+
+# Forward ANTHROPIC_API_KEY if set (optional — otherwise use `claude` interactive login)
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  args+=(-e ANTHROPIC_API_KEY)
+fi
+
+exec docker run "${args[@]}" "$IMAGE" \
+  bash -lc '
+    set -e
+
+    # Firewall
+    sudo /usr/local/bin/init-firewall.sh
+
+    # (/Users/$HOST_USERNAME/.claude -> /home/node/.claude symlink is baked into image)
+
+    # Sync mcpServers from host ~/.claude.json into container config.
+    # CLAUDE_CONFIG_DIR redirects where the CLI reads/writes .claude.json, so
+    # we must honor it — default $HOME/.claude.json is wrong when the env var is set.
+    if [ -f /yolo/host-claude.json ]; then
+      target="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+      host_mcps=$(jq -c ".mcpServers // {}" /yolo/host-claude.json 2>/dev/null || echo "{}")
+      if [ -f "$target" ]; then
+        jq --argjson m "$host_mcps" ".mcpServers = \$m" "$target" > "$target.tmp" && mv "$target.tmp" "$target"
+      else
+        echo "{\"mcpServers\": $host_mcps}" | jq . > "$target"
+      fi
+      count=$(echo "$host_mcps" | jq "keys | length")
+      echo "yolo: synced $count MCP server(s) from host -> $target"
+    fi
+
+    # Python project: sync deps into container-local .venv (anonymous volume)
+    if [ -f pyproject.toml ] && [ ! -x .venv/bin/python ]; then
+      echo "yolo: running uv sync..."
+      uv sync
+    fi
+
+    exec zsh
+  '
