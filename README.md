@@ -1,8 +1,57 @@
 # yolo-container
 
-OrbStack container for running `claude --dangerously-skip-permissions` without
-it being able to touch the Mac. One shared image, bind-mount whatever project
-you `cd` into.
+---
+
+## For the human
+
+**What this is.** A disposable Linux container on your Mac that runs Claude
+Code in full YOLO mode (`claude --dangerously-skip-permissions`) with no
+ability to touch your host filesystem, your LAN, or your cloud credentials.
+One shared image; whichever project directory you `cd` into gets
+bind-mounted inside. Exit the shell and the container vanishes.
+
+**Why you want it.** YOLO mode is the fastest way to work with Claude — no
+permission prompts, no babysitting. But a confused or malicious agent in
+YOLO mode on your bare Mac can `rm`, `chmod`, exfiltrate your SSH keys,
+pivot into your router, or push to the wrong remote. This setup keeps the
+speed (no prompts) and removes the blast radius (container + blacklist
+firewall + read-only host config). Use it for overnight runs, long
+agent-in-a-loop tasks, or anything you don't want to watch in real time.
+
+**How to use it.** Once installed:
+
+```sh
+cd ~/code/any-project
+yolo              # drops you into the container at /workspace
+cg                # alias for: claude --dangerously-skip-permissions
+```
+
+That's the whole workflow. Your edits flow live through the bind mount, so
+you can keep using your Mac-side editor. Your Claude login, shell history,
+and package caches survive across runs in named Docker volumes. Exit the
+shell when you're done.
+
+**What it protects.** Your host filesystem (read-only mount of `~/.claude`,
+nothing else visible), your LAN (firewall blocks 10/8, 172.16/12, 192.168/16,
+169.254/16), cloud metadata endpoints (same), outbound SMTP (spam path).
+
+**What it doesn't.** An agent can still read and exfiltrate anything it can
+reach *inside* the container: your project files, `ANTHROPIC_API_KEY`,
+`WANDB_API_KEY`, MCP tokens synced from the host, and it can sign things
+with your forwarded SSH agent (but not read the keys). Use this for code
+you wrote or trust — it's a convenience sandbox, not a zero-trust boundary.
+
+**If setup breaks or you want to customize.** Scroll past the divider below
+and hand the rest of this README to Claude; it's written for an agent
+installing or maintaining this on your behalf.
+
+---
+
+## For the coding agent
+
+Everything below is reference material for an LLM agent tasked with
+installing, debugging, or modifying this setup. Read top to bottom — the
+later sections assume the earlier ones as context.
 
 ## Files
 
