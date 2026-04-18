@@ -1,19 +1,15 @@
 {
-  "name": "Claude Code YOLO",
+  "name": "Claude Code YOLO (SLURM/podman)",
   "build": {
     "dockerfile": "Dockerfile",
     "args": {
-      "TZ": "${localEnv:TZ:America/Los_Angeles}",
+      "TZ": "${localEnv:TZ:UTC}",
       "CLAUDE_CODE_VERSION": "latest",
       "GIT_DELTA_VERSION": "0.18.2",
       "ZSH_IN_DOCKER_VERSION": "1.2.0",
       "HOST_USERNAME": "${localEnv:USER}"
     }
   },
-  "runArgs": [
-    "--cap-add=NET_ADMIN",
-    "--cap-add=NET_RAW"
-  ],
   "customizations": {
     "vscode": {
       "extensions": [
@@ -35,7 +31,7 @@
     "source=yolo-bashhistory,target=/commandhistory,type=volume",
     "source=yolo-claude-config,target=/home/node/.claude,type=volume",
     "source=yolo-uv-cache,target=/home/node/.cache/uv,type=volume",
-    "source=/run/host-services/ssh-auth.sock,target=/ssh-agent,type=bind",
+    "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind",
     "source=${localEnv:HOME}/.claude/CLAUDE.md,target=/home/node/.claude/CLAUDE.md,type=bind,readonly",
     "source=${localEnv:HOME}/.claude/settings.json,target=/home/node/.claude/settings.json,type=bind,readonly",
     "source=${localEnv:HOME}/.claude/settings.local.json,target=/home/node/.claude/settings.local.json,type=bind,readonly",
@@ -58,6 +54,6 @@
   },
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
   "workspaceFolder": "/workspace",
-  "postStartCommand": "bash -c 'sudo /usr/local/bin/init-firewall.sh && if [ -f /yolo/host-claude.json ]; then target=\"${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json\"; host_mcps=$(jq -c \".mcpServers // {}\" /yolo/host-claude.json 2>/dev/null || echo \"{}\"); if [ -f \"$target\" ]; then jq --argjson m \"$host_mcps\" \".mcpServers = \\$m\" \"$target\" > \"$target.tmp\" && mv \"$target.tmp\" \"$target\"; else echo \"{\\\"mcpServers\\\": $host_mcps}\" | jq . > \"$target\"; fi; echo \"yolo: synced MCPs from host -> $target\"; fi && if [ -f /workspace/pyproject.toml ] && [ ! -x /workspace/.venv/bin/python ]; then (cd /workspace && uv sync); fi'",
+  "postStartCommand": "bash -c 'if [ -f /yolo/host-claude.json ]; then target=\"${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json\"; host_mcps=$(jq -c \".mcpServers // {}\" /yolo/host-claude.json 2>/dev/null || echo \"{}\"); if [ -f \"$target\" ]; then jq --argjson m \"$host_mcps\" \".mcpServers = \\$m\" \"$target\" > \"$target.tmp\" && mv \"$target.tmp\" \"$target\"; else echo \"{\\\"mcpServers\\\": $host_mcps}\" | jq . > \"$target\"; fi; echo \"yolo: synced MCPs from host -> $target\"; fi && if [ -f /workspace/pyproject.toml ] && [ ! -x /workspace/.venv/bin/python ]; then (cd /workspace && uv sync); fi'",
   "waitFor": "postStartCommand"
 }

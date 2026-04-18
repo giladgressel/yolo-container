@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
 # yolo — run Claude Code in a YOLO container mounted on $PWD.
 #
+# SLURM/podman variant. Intended to be run either on a cluster login node or
+# on a compute node you've SSH'd into via an interactive SLURM allocation
+# (e.g. the rtx6000pro_golden.sh sleep-job trick — `sbatch` a node, then
+# `ssh` into it and work there).
+#
 # One shared image (yolo-claude:latest) built from this repo's .devcontainer/
-# dir (located automatically relative to this script, so it works when invoked
-# via a symlink in ~/.local/bin). Bind-mounts $PWD to /workspace. Container's
-# .venv is an anonymous volume so it never collides with the host's macOS .venv.
-# uv cache is a shared named volume.
+# dir. Bind-mounts $PWD to /workspace. Container's .venv is an anonymous
+# volume so it never collides with the host's .venv (glibc/ABI mismatch
+# between RHEL9 host and Debian container). uv cache is a shared named
+# volume.
 #
 # Host Claude config (CLAUDE.md, settings, skills, statusline) is mounted
-# READ-ONLY so the sandbox can read your preferences but can't modify them.
-# Changes made inside the container stay inside. To push a change back to the
-# host, copy it out manually (the "over-the-wall" flow).
+# READ-ONLY. Changes made inside the container stay inside. To push a change
+# back to the host, copy it out manually (the "over-the-wall" flow).
 #
-# Requires OrbStack (or any Docker) running. Stock macOS ssh-agent forwarded via
-# OrbStack's /run/host-services/ssh-auth.sock.
+# GPU passthrough is auto-detected: if CDI is configured, uses
+# `--device nvidia.com/gpu=all`; else if /dev/nvidiactl exists, bind-mounts
+# the nvidia device nodes and driver userspace libs. On the login node
+# (no GPU) it silently skips.
 
 set -euo pipefail
 
 IMAGE="yolo-claude:latest"
+ENGINE="${YOLO_ENGINE:-podman}"
 
 # Resolve this script's real location (follows symlinks, so ~/.local/bin/yolo
 # can symlink into the repo). CTX is the .devcontainer dir next to bin/.
@@ -30,33 +37,64 @@ done
 REPO_DIR="$(cd -P "$(dirname "$SCRIPT")/.." && pwd)"
 CTX="$REPO_DIR/.devcontainer"
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "yolo: docker CLI not found. Install OrbStack: brew install orbstack" >&2
+if ! command -v "$ENGINE" >/dev/null 2>&1; then
+  echo "yolo: $ENGINE CLI not found. Set YOLO_ENGINE=docker if you have docker instead." >&2
   exit 1
 fi
 
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+if ! "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "yolo: building $IMAGE (first run — a few minutes)..." >&2
-  docker build --build-arg "HOST_USERNAME=$(whoami)" -t "$IMAGE" "$CTX"
+  "$ENGINE" build -t "$IMAGE" "$CTX"
 fi
 
 args=(
   --rm -it
-  --cap-add=NET_ADMIN --cap-add=NET_RAW
-  --memory=8g --cpus=4
+  # SELinux: disable label enforcement for bind mounts. On RHEL9 the safer
+  # `:z` / `:Z` suffixes relabel source files, which we don't want for
+  # shared home dotfiles or NFS-backed workspaces.
+  --security-opt label=disable
   -v "$PWD:/workspace" -w /workspace
   -v /workspace/.venv
   -v yolo-uv-cache:/home/node/.cache/uv
   -v yolo-claude-config:/home/node/.claude
   -v yolo-bashhistory:/commandhistory
-  -v /run/host-services/ssh-auth.sock:/ssh-agent
-  -e SSH_AUTH_SOCK=/ssh-agent
   -e CLAUDE_CONFIG_DIR=/home/node/.claude
 )
 
-# Host config read-only (CLAUDE.md, settings, skills, statusline, starship, netrc, gitconfig)
-# Each mount is conditional on the host file existing — missing files are silently skipped,
-# so others can fork this repo without editing the list.
+# SSH agent forwarding — use whatever ssh set up on the host.
+if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+  args+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
+fi
+
+# --- GPU passthrough (auto-detect) ---------------------------------------
+gpu_mode="none"
+if command -v nvidia-ctk >/dev/null 2>&1 && \
+   { [ -d /etc/cdi ] || [ -d /var/run/cdi ]; } && \
+   ls /etc/cdi/nvidia*.yaml /var/run/cdi/nvidia*.yaml >/dev/null 2>&1; then
+  args+=(--device nvidia.com/gpu=all)
+  gpu_mode="cdi"
+elif [ -e /dev/nvidiactl ]; then
+  # Raw device + driver lib bind mount (no nvidia-container-toolkit on host).
+  # Passes only the nvidia* devices visible to this process — under an
+  # interactive SLURM session, cgroups limit visibility to the allocated GPU.
+  for dev in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+    [ -e "$dev" ] && args+=(--device "$dev")
+  done
+  for dev in /dev/nvidia[0-9]*; do
+    [ -e "$dev" ] && args+=(--device "$dev")
+  done
+  # Driver userspace libs — the container's CUDA runtime dlopens these.
+  # nvidia-smi is handy for sanity checks.
+  for lib in /usr/lib64/libcuda.so* /usr/lib64/libnvidia-ml.so* \
+             /usr/lib64/libnvidia-ptxjitcompiler.so* /usr/lib64/libnvidia-nvvm.so*; do
+    [ -e "$lib" ] && args+=(-v "$lib:$lib:ro")
+  done
+  [ -x /usr/bin/nvidia-smi ] && args+=(-v /usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro)
+  gpu_mode="devices"
+fi
+
+# Host config read-only (CLAUDE.md, settings, skills, statusline, starship, netrc, gitconfig).
+# Each mount is conditional on the host file existing — missing files are silently skipped.
 add_ro() { [ -e "$1" ] && args+=(-v "$1:$2:ro"); }
 add_ro_first() {
   # First candidate that exists wins; lets us prefer standard paths and fall back to dotfiles layouts.
@@ -91,14 +129,11 @@ if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   args+=(-e ANTHROPIC_API_KEY)
 fi
 
-exec docker run "${args[@]}" "$IMAGE" \
+echo "yolo: engine=$ENGINE gpu=$gpu_mode workspace=$PWD" >&2
+
+exec "$ENGINE" run "${args[@]}" "$IMAGE" \
   bash -lc '
     set -e
-
-    # Firewall
-    sudo /usr/local/bin/init-firewall.sh
-
-    # (/Users/$HOST_USERNAME/.claude -> /home/node/.claude symlink is baked into image)
 
     # Sync mcpServers from host ~/.claude.json into container config.
     # CLAUDE_CONFIG_DIR redirects where the CLI reads/writes .claude.json, so
