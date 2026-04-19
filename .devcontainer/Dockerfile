@@ -44,10 +44,12 @@ RUN SNIPPET="export PROMPT_COMMAND='history -a' && export HISTFILE=/commandhisto
 
 ENV DEVCONTAINER=true
 
-# Create workspace and config directories and set permissions
-# (.cache must exist node-owned *before* Docker mounts yolo-uv-cache onto .cache/uv,
-#  otherwise Docker auto-creates /home/node/.cache as root and breaks writes.)
-RUN mkdir -p /workspace /home/node/.claude /home/node/.cache /home/node/.config && \
+# Create workspace and config directories and set permissions.
+# The exact mount path (/home/node/.cache/uv) must exist node-owned *before* Docker
+# mounts yolo-uv-cache onto it — Docker auto-creates missing mount paths as root
+# and then seeds the empty named volume from that root-owned dir, locking it as
+# root forever. Pre-creating .cache is not enough; the /uv leaf must exist too.
+RUN mkdir -p /workspace /home/node/.claude /home/node/.cache/uv /home/node/.config && \
   chown -R node:node /workspace /home/node/.claude /home/node/.cache /home/node/.config
 
 # Host-style path symlink: settings.json often references the host path
