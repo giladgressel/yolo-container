@@ -52,3 +52,11 @@ echo "Firewall initialized: blacklist mode (private ranges + SMTP blocked, rest 
 if [ -S /ssh-agent ]; then
   chmod 666 /ssh-agent 2>/dev/null || true
 fi
+
+# /workspace/.venv is an anonymous volume so the container's venv never collides
+# with the host's macOS one. Docker auto-creates its mount path as root (and the
+# launcher's bind mount of $PWD -> /workspace shadows anything we'd bake into
+# the image), so uv sync as the node user hits EACCES. Fix at container start.
+if [ -d /workspace/.venv ]; then
+  chown node:node /workspace/.venv 2>/dev/null || true
+fi
