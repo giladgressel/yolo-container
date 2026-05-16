@@ -55,6 +55,32 @@ args=(
   -e CLAUDE_CONFIG_DIR=/home/node/.claude
 )
 
+# Git worktree support. In a linked worktree (Orca, `git worktree add`, …) the
+# .git inside $PWD is a FILE pointing at .git/worktrees/<name> in the main repo,
+# which lives outside the $PWD bind mount. Without this, every `git` command in
+# the container fails because the gitdir pointer doesn't resolve.
+#
+# Fix: locate the main repo's .git via the worktree's commondir, then mount it
+# at the same host path inside the container. The worktree's per-branch dir
+# (.git/worktrees/<name>) is a child of that, so one mount covers both.
+if [ -f "$PWD/.git" ]; then
+  worktree_gitdir=$(sed -n 's/^gitdir: //p' "$PWD/.git" 2>/dev/null || true)
+  if [ -n "$worktree_gitdir" ] && [ -d "$worktree_gitdir" ] && [ -f "$worktree_gitdir/commondir" ]; then
+    commondir_raw=$(cat "$worktree_gitdir/commondir")
+    if [ "${commondir_raw:0:1}" = "/" ]; then
+      main_gitdir="$commondir_raw"
+    else
+      main_gitdir=$(cd -P "$worktree_gitdir/$commondir_raw" 2>/dev/null && pwd || true)
+    fi
+    if [ -n "$main_gitdir" ] && [ -d "$main_gitdir" ]; then
+      args+=(-v "$main_gitdir:$main_gitdir")
+      echo "yolo: linked worktree detected — mounting $main_gitdir for git access" >&2
+    else
+      echo "yolo: warning — couldn't resolve main .git from worktree (commondir=$commondir_raw); git will be broken in container" >&2
+    fi
+  fi
+fi
+
 # Host config read-only (CLAUDE.md, settings, skills, statusline, starship, netrc, gitconfig)
 # Each mount is conditional on the host file existing — missing files are silently skipped,
 # so others can fork this repo without editing the list.
@@ -95,6 +121,14 @@ fi
 # Forward GH_TOKEN so gh CLI is pre-authenticated inside the container
 if [ -n "${GH_TOKEN:-}" ]; then
   args+=(-e GH_TOKEN)
+fi
+
+# Forward ORCA_WORKTREE_ID so Claude inside the container knows it's in an
+# Orca-managed worktree (drives the Delete/Sleep guidance in CLAUDE.md). Other
+# ORCA_* vars are skipped: they reference host-only paths or a hook port that
+# isn't reachable from the container without extra networking plumbing.
+if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
+  args+=(-e ORCA_WORKTREE_ID)
 fi
 
 exec docker run "${args[@]}" "$IMAGE" \

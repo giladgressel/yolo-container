@@ -9,6 +9,7 @@ ARG CLAUDE_CODE_VERSION=latest
 RUN apt-get update && apt-get install -y --no-install-recommends \
   less \
   git \
+  git-lfs \
   procps \
   sudo \
   fzf \
@@ -29,6 +30,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   build-essential \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Register the git-lfs filter system-wide so repos with `filter=lfs` in
+# .gitattributes work without each user/repo running `git lfs install`.
+# Without this, git status hashes the raw blob (slow on large files) and
+# reports clean LFS-tracked files as "modified" because the working-copy
+# content's SHA doesn't match the stored LFS pointer's SHA in the index.
+RUN git lfs install --system --skip-repo
 
 # Ensure default node user has access to /usr/local/share
 RUN mkdir -p /usr/local/share/npm-global && \
