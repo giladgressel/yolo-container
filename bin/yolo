@@ -107,6 +107,7 @@ add_ro_first                                 /home/node/.config/starship.toml \
   "$HOME/.dotfiles/starship.toml"
 add_ro "$HOME/.netrc"                        /home/node/.netrc
 add_ro "$HOME/.gitconfig"                    /home/node/.gitconfig
+add_ro "$HOME/.modal.toml"                   /home/node/.modal.toml
 
 # Forward WANDB_API_KEY so the wandb HTTP MCP can authenticate
 if [ -n "${WANDB_API_KEY:-}" ]; then
