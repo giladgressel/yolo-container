@@ -86,6 +86,14 @@ RUN curl -sS https://starship.rs/install.sh | sh -s -- --yes --bin-dir /usr/loca
 
 USER node
 
+# Pre-populate known_hosts so git push/pull works on first use.
+# Forwarded ssh-agent identity keys authenticate the user; known_hosts
+# authenticates the server. Without it, ssh aborts before offering keys
+# and the failure looks like an auth problem but isn't.
+RUN mkdir -p /home/node/.ssh && \
+  ssh-keyscan -t ed25519,rsa,ecdsa github.com >> /home/node/.ssh/known_hosts && \
+  chmod 644 /home/node/.ssh/known_hosts
+
 # Install global packages
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=$PATH:/usr/local/share/npm-global/bin
