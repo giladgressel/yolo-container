@@ -14,6 +14,12 @@
 #
 # Requires OrbStack (or any Docker) running. Stock macOS ssh-agent forwarded via
 # OrbStack's /run/host-services/ssh-auth.sock.
+#
+# Usage:
+#   yolo            launch the container in $PWD
+#   yolo --update   rebuild the image to pull the latest Claude Code, then exit
+#                   (aliases: --rebuild, -u). Run this whenever the container's
+#                   Claude falls behind your host's.
 
 set -euo pipefail
 
@@ -33,6 +39,22 @@ CTX="$REPO_DIR/.devcontainer"
 if ! command -v docker >/dev/null 2>&1; then
   echo "yolo: docker CLI not found. Install OrbStack: brew install orbstack" >&2
   exit 1
+fi
+
+# `yolo --update` (aliases: --rebuild, -u): rebuild the image from scratch so the
+# baked-in Claude Code CLI tracks the current @latest, then exit.
+#
+# Why --no-cache is required: the Dockerfile pins @latest, but that's a constant
+# string, so an ordinary rebuild hits Docker's layer cache and reinstalls the same
+# stale CLI. The container is ephemeral; the *image* is persistent and cached, so
+# this rebuild is the only thing that actually refreshes Claude. --pull also
+# refreshes the node:20 base.
+if [ "${1:-}" = "--update" ] || [ "${1:-}" = "--rebuild" ] || [ "${1:-}" = "-u" ]; then
+  echo "yolo: rebuilding $IMAGE from scratch (pulls latest Claude Code; a few minutes)..." >&2
+  docker build --pull --no-cache --build-arg "HOST_USERNAME=$(whoami)" -t "$IMAGE" "$CTX"
+  printf 'yolo: done. Claude Code in image is now: ' >&2
+  docker run --rm --entrypoint claude "$IMAGE" --version 2>/dev/null || echo "(version check failed)" >&2
+  exit 0
 fi
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then

@@ -36,6 +36,7 @@ launches are instant.
 cd ~/code/any-project
 yolo              # enters the container at /workspace
 cg                # alias for: claude --dangerously-skip-permissions
+yolo --update     # rebuild the image to pull the latest Claude Code, then exit
 ```
 
 Your edits flow live through the bind mount, so you can keep using your
@@ -285,8 +286,17 @@ yolo   # next run rebuilds
 
 **Update Claude Code to latest:**
 ```sh
-docker rmi yolo-claude:latest && yolo
+yolo --update   # aliases: --rebuild, -u
 ```
+This rebuilds the image from scratch (`docker build --no-cache --pull`) so the
+baked-in Claude Code CLI tracks the current `@latest`, then prints the new
+version. Run it whenever the container's Claude falls behind your host's.
+
+Why not just `docker rmi yolo-claude:latest && yolo`? Removing the image tag
+leaves Docker's *build cache* intact, so the next build reuses the cached
+`npm install -g @anthropic-ai/claude-code@latest` layer and reinstalls the **same
+stale version**. `@latest` is a constant string, so only `--no-cache` (what
+`yolo --update` runs) actually forces a fresh install.
 
 **Force re-login to Claude:**
 ```sh
