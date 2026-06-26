@@ -107,6 +107,94 @@ if [ -f "$PWD/.git" ]; then
   fi
 fi
 
+# --- Project mount manifest ----------------------------------------------
+# A project can declare extra host paths to bind-mount by listing them in a
+# manifest at the repo root (default: .yolo-mounts; override with
+# YOLO_MOUNTS_FILE). This is the "don't retype -v flags every run" feature:
+# centralized datasets, scratch dirs, shared model caches that live outside
+# $PWD get mounted automatically when you `yolo`.
+#
+# SAFETY: these are typically directories shared with the whole team, so every
+# manifest mount is READ-ONLY by default. A line must explicitly end in :rw to
+# be writable, and any :rw mount triggers a loud warning + typed confirmation
+# (since the container writes as your real host user — a bad write to shared
+# data is real and permanent). Bypass the prompt with YOLO_ALLOW_WRITE=1.
+#
+# One mount per line, using the same syntax as `podman -v`:
+#
+#   /data/shared/corpus                  # same path inside, READ-ONLY
+#   /data/shared/corpus:/data/corpus     # custom target inside, READ-ONLY
+#   /data/shared/outputs/$USER:...:rw    # explicitly writable (prompts!)
+#   ~/datasets:/datasets                 # leading ~ expands to $HOME
+#
+# Blank lines and everything after a # are ignored. A bare path mounts at the
+# identical path inside the container (so absolute paths baked into configs/
+# code still resolve). Missing sources are warned about and skipped, never
+# fatal — a stale entry on one machine won't abort the run.
+MOUNTS_FILE="${YOLO_MOUNTS_FILE:-$PWD/.yolo-mounts}"
+if [ -f "$MOUNTS_FILE" ]; then
+  mount_count=0
+  writable_mounts=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"                        # strip trailing comment
+    line="${line#"${line%%[![:space:]]*}"}"   # ltrim
+    line="${line%"${line##*[![:space:]]}"}"   # rtrim
+    [ -z "$line" ] && continue
+
+    src="${line%%:*}"                         # field before first colon
+    rest=""
+    [ "$line" != "$src" ] && rest="${line#*:}"
+    src="${src/#\~/$HOME}"                     # expand leading ~ on source
+    if [ ! -e "$src" ]; then
+      echo "yolo: warning — mount source not found, skipping: $src ($(basename "$MOUNTS_FILE"))" >&2
+      continue
+    fi
+
+    # Split the remainder into destination + options.
+    dst="$src"; opts=""                       # bare path → same path inside
+    if [ -n "$rest" ]; then
+      dst="${rest%%:*}"
+      [ "$rest" != "$dst" ] && opts="${rest#*:}"
+      dst="${dst/#\~/$HOME}"                   # expand leading ~ on target too
+    fi
+
+    # Read-only unless the line explicitly opts into rw. Anything that isn't a
+    # clear :rw (including a typo) fails safe to :ro.
+    case ",$opts," in
+      *,rw,*) args+=(-v "$src:$dst:rw"); writable_mounts+=("$src -> $dst") ;;
+      *)      args+=(-v "$src:$dst:ro") ;;
+    esac
+    mount_count=$((mount_count + 1))
+  done < "$MOUNTS_FILE"
+
+  # Friction gate for writable shared mounts: warn loudly, then require a typed
+  # confirmation. Fail closed if there's no TTY to ask. YOLO_ALLOW_WRITE=1 skips
+  # the prompt for scripted / non-interactive use.
+  if [ "${#writable_mounts[@]}" -gt 0 ] && [ "${YOLO_ALLOW_WRITE:-0}" != "1" ]; then
+    {
+      echo ""
+      echo "yolo: ⚠️  WRITABLE shared mounts requested via :rw in $(basename "$MOUNTS_FILE")"
+      echo "yolo:     Claude will be able to MODIFY or DELETE real files at:"
+      for m in "${writable_mounts[@]}"; do echo "yolo:        • $m"; done
+      echo "yolo:     These paths may be shared with your team — writes are permanent."
+      echo ""
+    } >&2
+    if [ ! -e /dev/tty ] && [ ! -t 0 ]; then
+      echo "yolo: no TTY to confirm writable mounts — refusing. Set YOLO_ALLOW_WRITE=1 to allow." >&2
+      exit 1
+    fi
+    printf "yolo: type 'yes' to mount these writable, anything else to abort: " >&2
+    if [ -e /dev/tty ]; then read -r reply < /dev/tty || reply=""; else read -r reply || reply=""; fi
+    if [ "$reply" != "yes" ]; then
+      echo "yolo: aborted — writable shared mounts not confirmed." >&2
+      exit 1
+    fi
+  fi
+
+  [ "$mount_count" -gt 0 ] && \
+    echo "yolo: mounted $mount_count path(s) from $(basename "$MOUNTS_FILE") (${#writable_mounts[@]} writable)" >&2
+fi
+
 # SSH agent forwarding — use whatever ssh set up on the host.
 if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
   args+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)

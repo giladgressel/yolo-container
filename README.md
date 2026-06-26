@@ -179,6 +179,55 @@ the `gitdir:` pointer, resolves `commondir`) and bind-mounts the main
 repo's `.git` at the same host path inside the container, so `git` works.
 A warning is printed if the main `.git` can't be resolved.
 
+### Extra project mounts (`.yolo-mounts`)
+
+`$PWD` is always mounted as `/workspace`, but projects often need data that
+lives *outside* the project dir — centralized datasets, shared scratch, a
+common model cache on the cluster. Rather than retyping `-v` flags every
+run, drop a `.yolo-mounts` manifest at the repo root and the wrapper mounts
+those paths automatically on every `yolo`. Override the location with
+`YOLO_MOUNTS_FILE`.
+
+One mount per line, same syntax as `podman -v`:
+
+```
+# Lines starting with # and blank lines are ignored.
+
+/data/shared/corpus                  # same path inside, READ-ONLY
+/data/shared/corpus:/data/corpus     # custom target inside, READ-ONLY
+/data/shared/outputs/$USER:/out:rw   # explicitly writable (prompts — see below)
+~/datasets:/datasets                 # leading ~ expands to $HOME
+```
+
+A bare path mounts at the *identical* path inside the container, so absolute
+paths baked into configs or code still resolve. Missing sources print a
+warning and are skipped — never fatal — so a manifest checked into the
+project doesn't break on a machine where some path is absent. Commit it to
+share the layout with your team, or keep it untracked for per-machine paths.
+
+**Read-only by default — this is the important part.** These directories are
+usually shared with the whole team, and the container writes as your *real
+host user*, so a bad write to shared data is real and permanent (file
+ownership won't save you — the dirs are group-writable). Therefore:
+
+- Every manifest mount is **read-only** unless its line explicitly ends in
+  `:rw`. A typo or any other option falls back to read-only — it fails safe.
+- Any `:rw` mount triggers a **loud warning listing the writable host paths,
+  then a typed `yes` confirmation** before the container starts. You can't
+  hand Claude write access to shared data by accident.
+- Set `YOLO_ALLOW_WRITE=1` to skip the prompt for scripted / non-interactive
+  runs. With no TTY and no `YOLO_ALLOW_WRITE=1`, a `:rw` mount **aborts**
+  (fail-closed) rather than silently proceeding.
+- Best practice: point `:rw` at a *per-user output subdir*
+  (`.../outputs/$USER`), never at the whole shared dataset.
+
+> Note: "let Claude add new files but never modify existing ones" isn't
+> something the Linux mount layer can enforce for group-writable shared data
+> (the sticky bit blocks deletes/renames but not content overwrites). So the
+> model is the binary `ro` (safe default) vs. confirmed `:rw`. If you want
+> writes that *can't* corrupt shared data at all, mount `:ro` and have Claude
+> write outputs into `/workspace` instead.
+
 ### What's shared from the host
 
 Read-only bind mounts (kernel rejects writes from inside the container):
