@@ -124,7 +124,7 @@ read it.
 
 | File | Purpose |
 |---|---|
-| `.devcontainer/Dockerfile` | Node 20 + zsh + starship + git + gh + uv + Claude Code CLI |
+| `.devcontainer/Dockerfile` | Node 20 + zsh + starship + git + git-lfs + gh + uv + Claude Code CLI |
 | `.devcontainer/devcontainer.json` | VS Code / Cursor "Reopen in Container" config (builds the image) |
 | `bin/yolo` | Terminal wrapper — symlinked into `~/.local/bin/yolo` |
 
@@ -143,6 +143,42 @@ This branch uses **rootless `podman`** (preinstalled on the cluster). The
 `YOLO_ENGINE=docker` to use docker instead if you somehow have it. All
 semantics are the same: `podman run`, `podman build`, `podman volume ls`.
 
+### Single-UID mode — the container runs as root
+
+This cluster account has **no subuid/subgid ranges**, so rootless podman
+falls back to single-UID mapping: the host UID maps to container uid 0 and
+nothing else is mappable. Two consequences, both handled in the Dockerfile
+and wrapper:
+
+- **Build.** apt postinst scripts and the git-delta `dpkg` chown files to
+  GIDs that don't exist in single-UID mode (adm, shadow, man, …); the real
+  chown then fails with `EINVAL` and aborts the install. The build runs apt
+  and that dpkg under `fakeroot` with `FAKEROOTDONTTRYCHOWN=1`, which fakes
+  those chowns instead of issuing them. apt's `_apt` sandbox user is also
+  disabled (`APT::Sandbox::User "root"`). All harmless when proper subuid
+  ranges exist.
+- **Runtime.** `USER node` (uid 1000) can't start (`setresgid` `EINVAL`),
+  so there is **no `USER node`** in the image — everything runs as root
+  with `HOME=/home/node`. Running as root inside a rootless container is
+  unprivileged on the host, so this doesn't widen the blast radius. The
+  wrapper passes `-e IS_SANDBOX=1` so Claude allows
+  `--dangerously-skip-permissions` as root (it otherwise refuses, erroring
+  "cannot be used with root/sudo privileges"). The old `node`-ownership
+  chowns are dropped (root owns everything).
+
+If your account *does* get subuid ranges (e.g. admins run `usermod
+--add-subuids`), this image still builds and runs — the fakeroot chowns
+just get faked instead of applied, which nothing depends on.
+
+### Git worktree support
+
+If `$PWD` is a linked git worktree (Orca, `git worktree add`, …), its
+`.git` is a *file* pointing at `.git/worktrees/<name>` in the main repo,
+which lives outside the `$PWD` bind mount. The wrapper detects this (reads
+the `gitdir:` pointer, resolves `commondir`) and bind-mounts the main
+repo's `.git` at the same host path inside the container, so `git` works.
+A warning is printed if the main `.git` can't be resolved.
+
 ### What's shared from the host
 
 Read-only bind mounts (kernel rejects writes from inside the container):
@@ -155,6 +191,7 @@ Read-only bind mounts (kernel rejects writes from inside the container):
   `~/.dotfiles/starship.toml` if the standard location is empty)
 - `~/.netrc` → wandb SDK auth
 - `~/.gitconfig` → commits carry the host user's name/email
+- `~/.modal.toml` → Modal CLI auth (skipped if absent)
 
 Synced at container start (host → container one-way, `mcpServers` only):
 
@@ -162,7 +199,11 @@ Synced at container start (host → container one-way, `mcpServers` only):
   `${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json` inside the container. Tokens
   travel; no other runtime state does.
 
-Env forwarded from host (only if set): `WANDB_API_KEY`, `ANTHROPIC_API_KEY`.
+Env forwarded from host (each only if set): `WANDB_API_KEY`,
+`ANTHROPIC_API_KEY`, `GH_TOKEN` (pre-auths the `gh` CLI),
+`ORCA_WORKTREE_ID` (tells Claude it's in an Orca-managed worktree; other
+`ORCA_*` vars are skipped — they reference host-only paths or an
+unreachable hook port).
 
 SSH agent: `$SSH_AUTH_SOCK` is bind-mounted as `/ssh-agent` and
 re-exported. Whatever agent your login shell has (openssh, forwarded from
@@ -237,6 +278,7 @@ one except it references the pre-built image instead of rebuilding:
     "source=yolo-bashhistory,target=/commandhistory,type=volume",
     "source=yolo-claude-config,target=/home/node/.claude,type=volume",
     "source=yolo-uv-cache,target=/home/node/.cache/uv,type=volume",
+    "source=yolo-uv-data,target=/home/node/.local/share/uv,type=volume",
     "source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind",
     "source=${localEnv:HOME}/.claude/CLAUDE.md,target=/home/node/.claude/CLAUDE.md,type=bind,readonly",
     "source=${localEnv:HOME}/.claude/settings.json,target=/home/node/.claude/settings.json,type=bind,readonly",
@@ -270,6 +312,13 @@ Then: **Cmd+Shift+P** → `Dev Containers: Reopen in Container`. Remove any
 mount whose host-side source doesn't exist for this user. Set
 `dev.containers.dockerPath` to `podman` in VS Code settings.
 
+**Single-UID caveat:** on an account without subuid ranges (see "Single-UID
+mode" above), `"remoteUser": "node"` won't start — the container can only
+run as root. Drop the `remoteUser` line (or set it to `root`) and the
+config/volume paths still resolve via `HOME=/home/node`. The `yolo` wrapper
+handles this automatically; only the hand-rolled devcontainer.json needs
+the tweak.
+
 ### Over-the-wall flow
 
 If you (the agent) want to change something on the host — new skill,
@@ -300,7 +349,8 @@ major version, but test before relying on it.
 | Volume | Holds |
 |---|---|
 | `yolo-claude-config` | `/home/node/.claude` — Claude login, runtime state |
-| `yolo-uv-cache` | uv's package cache, shared across projects |
+| `yolo-uv-cache` | `/home/node/.cache/uv` — uv's package cache, shared across projects |
+| `yolo-uv-data` | `/home/node/.local/share/uv` — uv-managed Python interpreters, so uv doesn't re-download CPython every run |
 | `yolo-bashhistory` | zsh/bash history across sessions |
 | anonymous (per-run) | `/workspace/.venv` — container's Linux venv, isolated from host's venv at the same path (glibc mismatch between RHEL9 host and Debian container) |
 
@@ -308,11 +358,13 @@ List: `podman volume ls | grep yolo`. Nuke one: `podman volume rm <name>`.
 
 ### Sandbox guarantees
 
-- **Root FS is read-only on mounted host paths** — `sudo chmod` fails
-  with `EROFS` regardless of UID. This is kernel-enforced, not
-  convention.
-- **No password sudo** inside the container — the `node` user has no
-  password set. `sudo` prompts and fails.
+- **Read-only host paths even as root** — the container runs as root
+  (single-UID mode, see above), but mounted host config is bind-mounted
+  read-only, so writes fail with `EROFS` regardless of UID. This is
+  kernel-enforced, not convention. Note: because it runs as root, `sudo`
+  *inside* the container does work (root needs no password) — it just
+  can't escape the rootless userns or write the read-only mounts. Root
+  here is unprivileged on the host.
 - **No host creds mounted** — no SSH keys (agent forwarded, signing
   only), no AWS/GCP creds, no `.credentials.json`.
 - **SLURM cgroup** — when running on a compute node inside an interactive
@@ -329,8 +381,14 @@ yolo   # next run rebuilds
 
 **Update Claude Code to latest:**
 ```sh
-podman rmi yolo-claude:latest && yolo
+yolo --update        # aliases: --rebuild, -u
 ```
+The Dockerfile pins Claude Code at `@latest`, but `@latest` is a constant
+string, so a plain rebuild hits the layer cache and reinstalls the *same*
+stale CLI. `yolo --update` runs `build --pull --no-cache` to force a real
+refresh (also re-pulls the `node:20` base), then prints the resulting
+Claude Code version and exits. (The old `podman rmi yolo-claude:latest &&
+yolo` also works but doesn't `--no-cache`, so it can keep a cached CLI.)
 
 **Force re-login to Claude:**
 ```sh
@@ -340,7 +398,7 @@ podman volume rm yolo-claude-config
 **Nuke everything** (login, history, cache — full reset):
 ```sh
 podman rmi yolo-claude:latest
-podman volume rm yolo-claude-config yolo-uv-cache yolo-bashhistory
+podman volume rm yolo-claude-config yolo-uv-cache yolo-uv-data yolo-bashhistory
 yolo
 ```
 
@@ -358,9 +416,11 @@ cluster admins.
 PATH; Dockerfile appends npm-global to PATH in `.zshrc` via a
 zsh-in-docker `-a` arg. Rebuild.
 
-**`[sudo] password for node:`** — the node user has no password. Nothing
-inside the container is supposed to need sudo. If something does, it's a
-regression — check what script is asking and drop the sudo call.
+**`[sudo] password for node:`** — not expected on this branch: the
+container runs as root (single-UID mode), so `sudo` is a no-op that needs
+no password. If you see this prompt you're somehow running as a non-root
+user — check that the image has no `USER node` line and that the run isn't
+overriding the user.
 
 **wandb MCP missing from `claude mcp list`** — MCP sync needs host
 `~/.claude.json` to exist and `CLAUDE_CONFIG_DIR` to resolve correctly.
