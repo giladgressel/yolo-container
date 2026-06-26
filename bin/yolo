@@ -59,6 +59,11 @@ args=(
   -v yolo-claude-config:/home/node/.claude
   -v yolo-bashhistory:/commandhistory
   -e CLAUDE_CONFIG_DIR=/home/node/.claude
+  # Single-UID mode forces the container to run as root (uid 0), and Claude
+  # refuses `--dangerously-skip-permissions` as root unless it knows it's
+  # sandboxed. This rootless container is exactly that, so flag it — otherwise
+  # the `cg` alias errors with "cannot be used with root/sudo privileges".
+  -e IS_SANDBOX=1
 )
 
 # SSH agent forwarding — use whatever ssh set up on the host.
@@ -95,7 +100,9 @@ fi
 
 # Host config read-only (CLAUDE.md, settings, skills, statusline, starship, netrc, gitconfig).
 # Each mount is conditional on the host file existing — missing files are silently skipped.
-add_ro() { [ -e "$1" ] && args+=(-v "$1:$2:ro"); }
+# `return 0` so a missing file (the common case) doesn't make the function
+# exit non-zero and trip `set -e`.
+add_ro() { [ -e "$1" ] && args+=(-v "$1:$2:ro"); return 0; }
 add_ro_first() {
   # First candidate that exists wins; lets us prefer standard paths and fall back to dotfiles layouts.
   local target="$1"; shift

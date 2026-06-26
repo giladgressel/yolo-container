@@ -1,129 +1,125 @@
 # SLURM port — current status
 
 Snapshot of where the `slurm-podman` branch port stands.
-Last touched: 2026-04-18, on login node `slurm-login-02.auth.ad.bgu.ac.il`.
+Last touched: 2026-06-26, on GPU node `ise-6000p-06.auth.ad.bgu.ac.il`
+(8× RTX PRO 6000 Blackwell).
 
-## What's done
+## TL;DR — it works now
 
-- `bin/yolo` rewritten for rootless podman: `$SSH_AUTH_SOCK` direct, GPU
-  auto-detect (CDI → /dev/nvidia* + driver libs → none), no NET_ADMIN,
-  `--security-opt label=disable` for RHEL9 SELinux, `YOLO_ENGINE`
-  override.
-- Dockerfile: dropped iptables/ipset/firewall sudoers. Swapped
-  `/Users/$HOST_USERNAME` → `/home/$HOST_USERNAME` symlink. Added
-  `openssh-client` so Claude can ssh back to the login node for
-  `squeue` / `sbatch`.
-- `.devcontainer/init-firewall.sh` deleted.
-- `devcontainer.json` updated to match.
-- README rewritten around the ssh-into-compute-node workflow
-  (`~/rtx6000pro_golden.sh` sleep-job trick).
-- Committed as `fed84ba` on `slurm-podman`. Not pushed.
-- `yolo` symlinked into `~/.local/bin/yolo`.
-- Out-of-repo config (survives across this repo's history):
-  `~/.config/containers/storage.conf` created to move graphroot/runroot
-  to `/tmp/podman-gressel/` (NFS home can't do overlay xattrs). Includes
-  `ignore_chown_errors = "true"` so image *pulls* succeed.
+`yolo` builds and runs on the cluster with no admin help and no subuid/subgid
+ranges. Verified end to end on the GPU node: image builds, container starts,
+`claude` runs, MCP servers sync from the host, and the GPU is visible inside
+(`nvidia-smi -L` lists the Blackwell cards). The container runs **as root
+inside** — which under rootless podman is just your unprivileged host uid
+(`343964018`), not real root.
 
-## What's blocked
+## The core constraint
 
-**The image won't build.** We have no subuid/subgid ranges, so podman
-uses single-UID mapping (host uid → container uid 0, everything else =
-invalid). `apt-get install` during the build chowns postinst files to
-non-zero GIDs (`adm`, `_apt`, `mail`, etc.) — those fail with `Invalid
-argument`. `ignore_chown_errors` only covers layer unpack, not runtime
-apt operations.
-
-A workaround commit (`Dockerfile` line: `APT::Sandbox::User "root"`) got
-us past apt's initial privilege drop, but the next chown (e.g. from
-`man-db` postinst) still fails. Patching every postinst is not viable.
-
-## What to do next
-
-### Option 1 — file a ticket (the right fix)
-
-Send cluster admins the note below. Standard one-line config. After this
-the branch should "just work" (assuming GPU passthrough behaves on the
-compute node — that's the next thing to test).
-
-### Option 2 — build the image off-cluster and load it here
-
-On a machine with working docker/podman (laptop, another cluster, CI):
-
-```sh
-git clone https://github.com/giladgressel/yolo-container.git
-cd yolo-container && git checkout slurm-podman
-podman build -t yolo-claude:latest .devcontainer/
-podman save yolo-claude:latest | xz > yolo-claude.tar.xz
-# scp to cluster, then on cluster:
-xz -d < yolo-claude.tar.xz | podman load
-```
-
-Pre-built images unpack (with `ignore_chown_errors`) and run fine in
-single-UID mode — only builds hit the chown wall.
-
-## Stuff that's still speculative, to verify once unblocked
-
-- `--security-opt label=disable` — fine on this login node, may need
-  tweaking on compute nodes depending on per-node SELinux policy.
-- GPU passthrough — untested. Auto-detect code paths are in
-  `bin/yolo`, but `/dev/nvidiactl` only exists on compute nodes. Run
-  `yolo` there and watch for `gpu=devices` in the `yolo:` banner.
-- Driver userspace libs live at `/usr/lib64/libcuda.so*` on this
-  cluster — verified on login node paths but not on the actual GPU
-  nodes (which may use `/usr/lib64/nvidia/` or elsewhere). Check with
-  `ls /usr/lib64/libcuda* /usr/lib64/libnvidia-ml*` on a GPU node.
-- SLURM-from-inside-container deliberately not wired. If Claude needs
-  `squeue`, it ssh's back to the login node via forwarded agent.
-
----
-
-## Draft ticket to admins
-
-Subject: **Rootless podman — need subuid/subgid ranges for my AD account**
-
-Hi,
-
-I'd like to use rootless `podman` on the cluster (tested from
-`slurm-login-02`). Right now my AD account (`gressel`, uid
-`343964018`) has no subuid/subgid ranges, so podman falls back to
-single-UID mapping. That breaks image builds: `apt-get install`
-postinst scripts chown to non-root GIDs (`_apt`=42, `adm`=4, etc.)
-which aren't in the namespace, and the install errors out with
-`Invalid argument`.
-
-Confirming:
+This AD account has no subuid/subgid ranges, so podman uses single-UID mapping:
 
 ```
-$ getsubids gressel
-Error fetching ranges
-
-$ getsubids -g gressel
-Error fetching ranges
-
-$ grep gressel /etc/subuid /etc/subgid
-(no output)
-
 $ podman unshare cat /proc/self/uid_map
          0  343964018          1
 ```
 
-The standard fix is a one-line entry each in `/etc/subuid` and
-`/etc/subgid` (or an AD/SSSD-integrated equivalent). For example:
+Only one UID exists in the namespace (host uid → container uid 0). Everything
+downstream follows from that. The "right fix" is still one line in `/etc/subuid`
++ `/etc/subgid` from the admins, but we don't need it — see the draft note at the
+bottom if you ever want to file it.
 
+## How the single-UID walls were cleared
+
+There were two independent walls, both caused by the missing subuid ranges.
+
+### 1. Build-time: apt postinst chowns (`.devcontainer/Dockerfile`)
+
+`apt-get install` postinst scripts chown/chgrp files to GIDs that don't exist in
+single-UID mode (`adm`, `shadow`, `man`, `_apt`, …). The real chown returns
+`EINVAL` and aborts the install (`man-db` and `openssh-client` are the usual
+first casualties).
+
+Fix: run apt under **`fakeroot` with `FAKEROOTDONTTRYCHOWN=1`**. fakeroot
+intercepts the chowns; the env var is the crucial part — without it fakeroot
+*still issues the real chown first* and propagates its `EINVAL`, so plain
+fakeroot is not enough. The Dockerfile bootstraps fakeroot, then wraps the heavy
+apt install and the git-delta `dpkg -i` in it. `APT::Sandbox::User "root"` is
+still needed too (keeps apt from dropping to uid 42 before fakeroot is in play).
+
+### 2. Runtime: can't run as `node` (uid 1000)
+
+The upstream image ran as `USER node`. In single-UID mode that's impossible —
+`setresgid to 1000` fails with `Invalid argument`, so the container won't even
+start. Only uid 0 is mappable.
+
+Fix: the image runs **as root** (`USER node` dropped) with `HOME=/home/node` so
+the existing config/volume layout and the `yolo` bind mounts still line up. The
+old `chown node:node` build steps were removed (they'd fail the same way, and
+root owns everything anyway). This means a prebuilt `USER node` image can't just
+be `podman load`ed and run here either — note for anyone who revisits the
+"build off-cluster" idea below.
+
+### 3. Cosmetic: zsh privilege-drop warnings
+
+Running zsh as root in a userns where `/proc/self/setgroups` is `deny` made the
+fzf shell-integration scripts spam `can't drop privileges; failed to set
+supplementary group list` on every prompt (their option save/restore re-applies
+`privileged off`). Fixed by sourcing the fzf example scripts with `2>/dev/null`
+and dropping the duplicate `fzf` oh-my-zsh plugin. Key bindings still work.
+
+### 4. Unrelated `set -e` bug in `bin/yolo`
+
+The `add_ro` helper returned non-zero when a host config file was missing (the
+common case), which tripped `set -e` and aborted `yolo` before it ever launched
+— with no error message. Fixed with a trailing `return 0`.
+
+## Out-of-repo config (must exist on each node)
+
+`~/.config/containers/storage.conf` points podman's graphroot/runroot at
+node-local `/tmp/podman-gressel/` (NFS home can't do overlay xattrs) and sets
+`ignore_chown_errors = "true"` so image *pulls* unpack in single-UID mode. This
+file lives outside the repo and survives across branches. Because `/tmp` is
+node-local, the first `yolo` run on each new node rebuilds the image (a few
+minutes).
+
+## Verified on this node
+
+- Image builds clean end to end (`podman build .devcontainer/`).
+- `yolo` runs: `gpu=devices` auto-detected, container starts as uid 0 with
+  `HOME=/home/node`, `claude` (2.1.x) on PATH, MCP sync works.
+- GPU passthrough via raw-device mode: device nodes + `/usr/lib64/libcuda.so*`
+  / `libnvidia-ml.so*` bind-mounted, `nvidia-smi -L` works inside.
+- `--security-opt label=disable` fine on this node.
+
+## Still worth checking
+
+- Other GPU node types / driver lib locations (here they're `/usr/lib64/`).
+- CDI path (`--device nvidia.com/gpu=all`) is untested — this node has no
+  `nvidia-ctk`, so `yolo` falls back to raw-device mode. Fine as is.
+- SLURM-from-inside-container is still deliberately not wired; ssh back to the
+  login node via the forwarded agent if Claude needs `squeue`/`sbatch`.
+
+---
+
+## If you ever want the "proper" fix (optional)
+
+A one-line subuid/subgid range from admins would let the container run as a real
+`node` user again and drop the fakeroot/root workarounds. Not required — the
+current setup works — but here's the note:
+
+> My AD account (`gressel`, uid `343964018`) has no subuid/subgid ranges, so
+> rootless podman falls back to single-UID mapping. Standard fix is one entry
+> each in `/etc/subuid` and `/etc/subgid` (or the SSSD-integrated equivalent),
+> e.g. `usermod --add-subuids 200000-265535 --add-subgids 200000-265535 gressel`.
+
+### Or build off-cluster and load
+
+On a machine with working docker/podman:
+
+```sh
+podman build -t yolo-claude:latest .devcontainer/
+podman save yolo-claude:latest | xz > yolo-claude.tar.xz
+# scp to cluster, then: xz -d < yolo-claude.tar.xz | podman load
 ```
-gressel:200000:65536
-```
 
-or the usermod equivalent:
-
-```
-usermod --add-subuids 200000-265535 --add-subgids 200000-265535 gressel
-```
-
-After that, `newuidmap` / `newgidmap` can set up a proper user
-namespace mapping (65k UIDs) and regular rootless podman image builds
-should work. Happy to test whenever it's in place. If this needs to be
-applied more broadly than just my account (e.g. via an SSSD override
-template), let me know and I can coordinate.
-
-Thanks!
+Note: build this branch's Dockerfile (root-mode). An upstream `USER node` image
+won't start here (see wall #2).
