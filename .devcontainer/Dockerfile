@@ -83,9 +83,16 @@ RUN mkdir -p /workspace /home/node/.claude /home/node/.cache/uv \
 # The forwarded ssh-agent authenticates the user; known_hosts authenticates the
 # server. Without it ssh aborts before offering keys and it looks like an auth
 # failure but isn't.
-RUN mkdir -p /home/node/.ssh && \
-  ssh-keyscan -t ed25519,rsa,ecdsa github.com >> /home/node/.ssh/known_hosts && \
-  chmod 644 /home/node/.ssh/known_hosts
+#
+# Write to the SYSTEM-WIDE known_hosts (/etc/ssh/ssh_known_hosts), not
+# ~/.ssh/known_hosts. ssh locates the per-user file via the passwd-DB home
+# (getpwuid), not $HOME — and single-UID mode forces this container to run as
+# root (home /root), so a file under /home/node/.ssh would never be consulted.
+# The global file is checked for every user regardless of UID/home, so this
+# works both in root mode here and as `node` if subuid ranges are ever added.
+RUN mkdir -p /etc/ssh && \
+  ssh-keyscan -t ed25519,rsa,ecdsa github.com >> /etc/ssh/ssh_known_hosts && \
+  chmod 644 /etc/ssh/ssh_known_hosts
 
 # Host-style path symlink: settings.json often references the host path
 # (e.g. /home/$HOST_USERNAME/.claude/statusline-command.sh). Create the symlink
