@@ -42,6 +42,20 @@ if ! command -v "$ENGINE" >/dev/null 2>&1; then
   exit 1
 fi
 
+# `yolo --update` (aliases: --rebuild, -u): rebuild the image from scratch so the
+# baked-in Claude Code CLI tracks the current @latest, then exit. The Dockerfile
+# pins @latest, but that's a constant string, so an ordinary rebuild hits the
+# layer cache and reinstalls the same stale CLI. --no-cache forces the refresh;
+# --pull also refreshes the node:20 base.
+if [ "${1:-}" = "--update" ] || [ "${1:-}" = "--rebuild" ] || [ "${1:-}" = "-u" ]; then
+  echo "yolo: rebuilding $IMAGE from scratch (pulls latest Claude Code; a few minutes)..." >&2
+  "$ENGINE" build --pull --no-cache -t "$IMAGE" "$CTX"
+  printf 'yolo: done. Claude Code in image is now: ' >&2
+  "$ENGINE" run --rm --entrypoint /usr/local/share/npm-global/bin/claude "$IMAGE" --version 2>/dev/null \
+    || echo "(version check failed)" >&2
+  exit 0
+fi
+
 if ! "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
   echo "yolo: building $IMAGE (first run — a few minutes)..." >&2
   "$ENGINE" build -t "$IMAGE" "$CTX"
@@ -56,6 +70,7 @@ args=(
   -v "$PWD:/workspace" -w /workspace
   -v /workspace/.venv
   -v yolo-uv-cache:/home/node/.cache/uv
+  -v yolo-uv-data:/home/node/.local/share/uv
   -v yolo-claude-config:/home/node/.claude
   -v yolo-bashhistory:/commandhistory
   -e CLAUDE_CONFIG_DIR=/home/node/.claude
@@ -65,6 +80,32 @@ args=(
   # the `cg` alias errors with "cannot be used with root/sudo privileges".
   -e IS_SANDBOX=1
 )
+
+# Git worktree support. In a linked worktree (Orca, `git worktree add`, …) the
+# .git inside $PWD is a FILE pointing at .git/worktrees/<name> in the main repo,
+# which lives outside the $PWD bind mount. Without this, every `git` command in
+# the container fails because the gitdir pointer doesn't resolve.
+#
+# Fix: locate the main repo's .git via the worktree's commondir, then mount it
+# at the same host path inside the container. The worktree's per-branch dir
+# (.git/worktrees/<name>) is a child of that, so one mount covers both.
+if [ -f "$PWD/.git" ]; then
+  worktree_gitdir=$(sed -n 's/^gitdir: //p' "$PWD/.git" 2>/dev/null || true)
+  if [ -n "$worktree_gitdir" ] && [ -d "$worktree_gitdir" ] && [ -f "$worktree_gitdir/commondir" ]; then
+    commondir_raw=$(cat "$worktree_gitdir/commondir")
+    if [ "${commondir_raw:0:1}" = "/" ]; then
+      main_gitdir="$commondir_raw"
+    else
+      main_gitdir=$(cd -P "$worktree_gitdir/$commondir_raw" 2>/dev/null && pwd || true)
+    fi
+    if [ -n "$main_gitdir" ] && [ -d "$main_gitdir" ]; then
+      args+=(-v "$main_gitdir:$main_gitdir")
+      echo "yolo: linked worktree detected — mounting $main_gitdir for git access" >&2
+    else
+      echo "yolo: warning — couldn't resolve main .git from worktree (commondir=$commondir_raw); git will be broken in container" >&2
+    fi
+  fi
+fi
 
 # SSH agent forwarding — use whatever ssh set up on the host.
 if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
@@ -125,6 +166,7 @@ add_ro_first                                 /home/node/.config/starship.toml \
   "$HOME/.dotfiles/starship.toml"
 add_ro "$HOME/.netrc"                        /home/node/.netrc
 add_ro "$HOME/.gitconfig"                    /home/node/.gitconfig
+add_ro "$HOME/.modal.toml"                   /home/node/.modal.toml
 
 # Forward WANDB_API_KEY so the wandb HTTP MCP can authenticate
 if [ -n "${WANDB_API_KEY:-}" ]; then
@@ -134,6 +176,19 @@ fi
 # Forward ANTHROPIC_API_KEY if set (optional — otherwise use `claude` interactive login)
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   args+=(-e ANTHROPIC_API_KEY)
+fi
+
+# Forward GH_TOKEN so gh CLI is pre-authenticated inside the container
+if [ -n "${GH_TOKEN:-}" ]; then
+  args+=(-e GH_TOKEN)
+fi
+
+# Forward ORCA_WORKTREE_ID so Claude inside the container knows it's in an
+# Orca-managed worktree (drives the Delete/Sleep guidance in CLAUDE.md). Other
+# ORCA_* vars are skipped: they reference host-only paths or a hook port that
+# isn't reachable from the container without extra networking plumbing.
+if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
+  args+=(-e ORCA_WORKTREE_ID)
 fi
 
 echo "yolo: engine=$ENGINE gpu=$gpu_mode workspace=$PWD" >&2

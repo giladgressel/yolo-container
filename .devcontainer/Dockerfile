@@ -28,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends fakeroot \
 RUN apt-get update && FAKEROOTDONTTRYCHOWN=1 fakeroot apt-get install -y --no-install-recommends \
   less \
   git \
+  git-lfs \
   procps \
   sudo \
   fzf \
@@ -47,6 +48,13 @@ RUN apt-get update && FAKEROOTDONTTRYCHOWN=1 fakeroot apt-get install -y --no-in
   build-essential \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Register the git-lfs filter system-wide so repos with `filter=lfs` in
+# .gitattributes work without each user/repo running `git lfs install`.
+# Without this, git status hashes the raw blob (slow on large files) and
+# reports clean LFS-tracked files as "modified" because the working-copy
+# content's SHA doesn't match the stored LFS pointer's SHA in the index.
+RUN git lfs install --system --skip-repo
+
 # Single-UID note: with no subuid/subgid ranges the container can only run as
 # one UID (host uid -> container uid 0 = root), so this image runs as root
 # throughout. Running as root inside a rootless container is unprivileged on the
@@ -64,8 +72,20 @@ RUN mkdir /commandhistory && touch /commandhistory/.bash_history
 ENV DEVCONTAINER=true
 ENV HOME=/home/node
 
-# Create workspace and config directories.
-RUN mkdir -p /workspace /home/node/.claude /home/node/.cache /home/node/.config
+# Create workspace and config directories. The exact named-volume mount paths
+# (.cache/uv, .local/share/uv) are pre-created so the engine mounts onto an
+# existing dir rather than auto-creating it. The .local/share/uv volume persists
+# uv-managed Python interpreters so uv doesn't re-download CPython every run.
+RUN mkdir -p /workspace /home/node/.claude /home/node/.cache/uv \
+             /home/node/.local/share/uv /home/node/.config
+
+# Pre-populate known_hosts so git push/pull over ssh works on first use.
+# The forwarded ssh-agent authenticates the user; known_hosts authenticates the
+# server. Without it ssh aborts before offering keys and it looks like an auth
+# failure but isn't.
+RUN mkdir -p /home/node/.ssh && \
+  ssh-keyscan -t ed25519,rsa,ecdsa github.com >> /home/node/.ssh/known_hosts && \
+  chmod 644 /home/node/.ssh/known_hosts
 
 # Host-style path symlink: settings.json often references the host path
 # (e.g. /home/$HOST_USERNAME/.claude/statusline-command.sh). Create the symlink
