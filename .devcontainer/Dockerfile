@@ -42,6 +42,7 @@ RUN apt-get update && FAKEROOTDONTTRYCHOWN=1 fakeroot apt-get install -y --no-in
   jq \
   nano \
   vim \
+  tmux \
   curl \
   openssh-client \
   ca-certificates \
