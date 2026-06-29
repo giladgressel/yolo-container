@@ -271,9 +271,11 @@ the pane still points at the *old* forwarded socket, which died with the
 first connection. Pointing `$SSH_AUTH_SOCK` at a stable `~/.ssh/agent.sock`
 symlink that each fresh shell re-points at the current agent decouples the
 path (safe to freeze in tmux) from the target (refreshed per connection).
-Add this to a shell rc that runs on every login — for this cluster it
-lives in a per-host file outside the dotfiles repo,
-`~/.config/zsh/hosts/<host>.zsh`, so it stays cluster-local:
+Add this to a shell rc that runs on every login. Put it in a cluster-local
+file outside the dotfiles repo so it doesn't follow you to other machines —
+here it's sourced from `~/.config/zsh/secrets.zsh` (always sourced), which
+covers every node reached via ProxyJump (`ise-*`, `cs-*`, `dt-*`, `ee-*`)
+without a per-host file per family:
 
 ```sh
 if [ -S "$SSH_AUTH_SOCK" ] && [ "$SSH_AUTH_SOCK" != "$HOME/.ssh/agent.sock" ]; then
