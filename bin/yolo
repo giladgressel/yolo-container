@@ -195,9 +195,30 @@ if [ -f "$MOUNTS_FILE" ]; then
     echo "yolo: mounted $mount_count path(s) from $(basename "$MOUNTS_FILE") (${#writable_mounts[@]} writable)" >&2
 fi
 
-# SSH agent forwarding — use whatever ssh set up on the host.
-if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
-  args+=(-v "$SSH_AUTH_SOCK:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
+# SSH agent forwarding. Prefer the live socket inherited from the launching
+# shell. If that's stale — e.g. a tmux pane reattached from a different client,
+# so $SSH_AUTH_SOCK still points at a forwarded socket that died with the old
+# connection — fall back to the stable ~/.ssh/agent.sock symlink that a fresh
+# shell keeps pointed at the current live agent (see hosts/<host>.zsh snippet
+# in the README). Refresh that symlink from whatever we settle on, then mount
+# it so the container always has one stable source path.
+#
+# Note: a running container's bind mount is pinned at launch, so after you
+# switch clients you must re-run yolo to pick up the now-live socket — the
+# symlink just makes that a clean restart instead of a reconfigure.
+ssh_sock="${SSH_AUTH_SOCK:-}"
+if [ ! -S "$ssh_sock" ] && [ -S "$HOME/.ssh/agent.sock" ]; then
+  ssh_sock="$HOME/.ssh/agent.sock"
+fi
+if [ -S "$ssh_sock" ]; then
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh" 2>/dev/null || true
+  ln -sf "$ssh_sock" "$HOME/.ssh/agent.sock" 2>/dev/null || true
+  args+=(-v "$HOME/.ssh/agent.sock:/ssh-agent" -e SSH_AUTH_SOCK=/ssh-agent)
+else
+  echo "yolo: warning — no live SSH agent socket (SSH_AUTH_SOCK='${SSH_AUTH_SOCK:-}')." >&2
+  echo "yolo:   git/ssh over SSH won't work in the container. Reconnect with agent" >&2
+  echo "yolo:   forwarding (ssh -A / 'ForwardAgent yes'), confirm with 'ssh-add -l'," >&2
+  echo "yolo:   then re-run yolo." >&2
 fi
 
 # --- GPU passthrough (auto-detect) ---------------------------------------

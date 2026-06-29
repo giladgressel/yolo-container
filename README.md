@@ -254,11 +254,43 @@ Env forwarded from host (each only if set): `WANDB_API_KEY`,
 `ORCA_*` vars are skipped — they reference host-only paths or an
 unreachable hook port).
 
-SSH agent: `$SSH_AUTH_SOCK` is bind-mounted as `/ssh-agent` and
+SSH agent: a live agent socket is bind-mounted as `/ssh-agent` and
 re-exported. Whatever agent your login shell has (openssh, forwarded from
-your laptop, 1Password — anything exposing a unix socket in the
-`SSH_AUTH_SOCK` env var) carries into the container. If `SSH_AUTH_SOCK`
-is unset on the host, the mount is skipped silently.
+your laptop, 1Password — anything exposing a unix socket) carries into the
+container. `bin/yolo` resolves the socket in this order: the live
+`$SSH_AUTH_SOCK` it inherits; else the stable `~/.ssh/agent.sock` symlink
+(see below). It refreshes that symlink to whatever it settles on, then
+mounts the symlink so the source path is stable. If neither is live it
+prints a warning and skips the mount (git-over-SSH won't work in the
+container).
+
+**Why the symlink** — tmux freezes `$SSH_AUTH_SOCK` at session-create
+time. If you start tmux + yolo from one client (say a VS Code terminal),
+disconnect, then reattach the same tmux from another client (Ghostty),
+the pane still points at the *old* forwarded socket, which died with the
+first connection. Pointing `$SSH_AUTH_SOCK` at a stable `~/.ssh/agent.sock`
+symlink that each fresh shell re-points at the current agent decouples the
+path (safe to freeze in tmux) from the target (refreshed per connection).
+Add this to a shell rc that runs on every login — for this cluster it
+lives in a per-host file outside the dotfiles repo,
+`~/.config/zsh/hosts/<host>.zsh`, so it stays cluster-local:
+
+```sh
+if [ -S "$SSH_AUTH_SOCK" ] && [ "$SSH_AUTH_SOCK" != "$HOME/.ssh/agent.sock" ]; then
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  ln -sf "$SSH_AUTH_SOCK" "$HOME/.ssh/agent.sock"
+fi
+[ -e "$HOME/.ssh/agent.sock" ] && export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock"
+```
+
+A *running* container's mount is pinned at launch, so switching clients
+still means **re-running yolo** (the container restart) to pick up the new
+socket — the symlink just makes that a clean restart, and `claude --resume`
+brings the session back (history lives in the `yolo-claude-config` volume,
+not the container). Caveat: `~/.ssh` is NFS-shared but agent sockets are
+node-local, so this one symlink is owned by whichever node you last
+connected from — correct for one-node-at-a-time use, but two concurrent
+nodes would fight over it.
 
 All host-path mounts in `bin/yolo` are **conditional on the source file
 existing** (via `add_ro`). Forks without e.g. `.netrc` see no error — the
@@ -496,9 +528,23 @@ user changes, rebuild.
 
 **SSH agent: `Could not open a connection to your authentication agent`**
 — `$SSH_AUTH_SOCK` inside the container should be `/ssh-agent`, and on
-the host `ssh-add -l` must list keys. If the host's `$SSH_AUTH_SOCK` is
-unset, the mount is skipped silently and agent forwarding won't work.
-Check by running `echo $SSH_AUTH_SOCK` on the host before launching.
+the host `ssh-add -l` must list keys. `bin/yolo` now prints a warning at
+launch if it can't find a live socket, so a fresh `yolo` won't silently
+start broken — heed that warning and reconnect with agent forwarding
+before continuing.
+
+**SSH worked, then stopped after I reconnected from another client** —
+the classic case: you started tmux + yolo from a VS Code terminal,
+disconnected, then reattached the same tmux from Ghostty (or vice-versa).
+The tmux pane froze the *old* forwarded socket, which died with the first
+connection, and the already-running container's `/ssh-agent` mount is
+pinned to it. Recovery: make sure your new shell refreshed the symlink
+(`ls -l ~/.ssh/agent.sock` should point at a live socket; `ssh-add -l`
+lists keys), then **exit Claude and re-run `yolo`** — the new container
+grabs the live socket. `claude --resume` brings your session back. You do
+*not* need to restart tmux. See "What's shared from the host → SSH agent"
+for the symlink mechanism that makes the re-run pick up the live socket
+even from a stale tmux pane.
 
 **SELinux denials in `/var/log/audit/audit.log`** — the wrapper passes
 `--security-opt label=disable` which should avoid relabeling host paths.
