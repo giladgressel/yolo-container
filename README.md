@@ -414,18 +414,53 @@ protocol, so they're expecting it.
 
 ### SLURM from inside the container
 
-Not wired in this branch. The image has no `sbatch`/`squeue`/`srun`, no
-munge socket, no slurm.conf. If Claude needs to submit or check jobs, the
-simplest path is `ssh <login-node> squeue -u $USER` etc. — the forwarded
-ssh-agent makes this work without passwords. (Your login shell on the
-compute node can also ssh to the login node if it's in known_hosts.)
+The image has no `sbatch`/`squeue`/`srun`, no munge socket, no slurm.conf —
+and deliberately so. Instead of putting a slurm client *in* the container
+(which means matching the site's slurm version and solving munge auth under
+single-UID userns), the **`cluster`** helper (`bin/cluster`) ssh'es to your
+login node over the forwarded ssh-agent and runs slurm there. Zero version
+risk, no munge plumbing, and it works from any node the container runs on.
 
-If you want SLURM commands *inside* the container, the cleanest approach
-is to install `slurm-client` + `libmunge2` in the Debian image and
-bind-mount `/var/run/munge/` plus whatever slurm.conf the site uses (find
-it with `scontrol show config | grep SLURM_CONF`). Protocol compat
-between Debian slurm-client and RHEL9 slurmd is usually fine within a
-major version, but test before relying on it.
+```sh
+cluster squeue --me
+cluster sacct -j 12345 --format=JobID,State,Elapsed,MaxRSS
+cluster bash batch_submit.sh --gpu pro runs/exp.sh   # from your project dir
+cluster scancel 12345
+```
+
+`bin/yolo` bind-mounts `cluster` onto the container's PATH, so it's available
+in every container from any project (no rebuild).
+
+**One-time per-user setup (each labmate does this on their own account):**
+
+```sh
+mkdir -p ~/.config/yolo
+cp cluster.env.example ~/.config/yolo/cluster.env
+$EDITOR ~/.config/yolo/cluster.env        # login host, your username, key name
+```
+
+Nothing user-specific is committed: `bin/cluster` reads everything from the
+environment, and `bin/yolo` sources your private `~/.config/yolo/cluster.env`
+and forwards it in. Your SSH **key never leaves the agent** — the config only
+names *which* loaded key to pin (pinning avoids "Too many authentication
+failures" when the agent carries several keys; also note the container runs as
+uid 0, so the username is required or ssh tries `root@`).
+
+**Path translation.** The container mounts your project at `/workspace`, but a
+submitted job runs on a compute node in the *host* filesystem, where
+`/workspace` doesn't exist. `bin/yolo` forwards the real launch path as
+`YOLO_WS_HOST` (it differs per project — `/home/you/proj`, not a fixed home),
+and `cluster` rewrites `/workspace/...` → that path (in both the working dir
+and arguments) so job scripts baking in `$CWD` / `--output=$CWD/logs/...`
+resolve. This assumes your home/project dir is on shared storage (NFS) visible
+from the login and compute nodes — the normal HPC case.
+
+> If you ever *do* want native slurm inside the container instead, the
+> alternative is to bind-mount the host's own slurm binaries + `/usr/lib64/slurm`
+> + `libmunge.so` + the munge socket + slurm.conf (using the host binaries
+> sidesteps the Debian-vs-host version mismatch). It was not chosen here because
+> of the munge-uid-under-single-UID-userns unknown; the ssh path is simpler and
+> proven.
 
 ### Persistent state (named podman volumes)
 

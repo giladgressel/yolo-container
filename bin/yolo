@@ -81,6 +81,13 @@ args=(
   -e IS_SANDBOX=1
 )
 
+# Make the `cluster` helper available on PATH inside every container, from any
+# project. The yolo container has no SLURM client; `cluster <cmd>` runs slurm
+# commands on the login node over the forwarded ssh-agent (see bin/cluster).
+# Mounted from this repo (on NFS) so it works regardless of which project dir
+# you launched from, and edits to the helper need no image rebuild.
+[ -x "$REPO_DIR/bin/cluster" ] && args+=(-v "$REPO_DIR/bin/cluster:/usr/local/bin/cluster:ro")
+
 # Git worktree support. In a linked worktree (Orca, `git worktree add`, …) the
 # .git inside $PWD is a FILE pointing at .git/worktrees/<name> in the main repo,
 # which lives outside the $PWD bind mount. Without this, every `git` command in
@@ -299,6 +306,21 @@ fi
 if [ -n "${ORCA_WORKTREE_ID:-}" ]; then
   args+=(-e ORCA_WORKTREE_ID)
 fi
+
+# SLURM-from-container config for the `cluster` helper. The image has no slurm
+# client; `cluster` ssh'es to your login node and runs slurm there. The login
+# host, username, and which agent key to use are USER-SPECIFIC, so they live in
+# a local, uncommitted file — never in this repo. Source it if present and
+# forward the values. Always forward the real host path of /workspace
+# (YOLO_WS_HOST=$PWD) so `cluster` can translate paths for jobs that run on
+# compute nodes, where /workspace doesn't exist. See cluster.env.example.
+CLUSTER_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/yolo/cluster.env"
+# shellcheck disable=SC1090
+[ -f "$CLUSTER_ENV" ] && . "$CLUSTER_ENV"
+args+=(-e "YOLO_WS_HOST=$PWD")
+for v in YOLO_SLURM_LOGIN YOLO_SLURM_USER YOLO_SLURM_KEY YOLO_WS_CONTAINER; do
+  [ -n "${!v:-}" ] && args+=(-e "$v=${!v}")
+done
 
 echo "yolo: engine=$ENGINE gpu=$gpu_mode workspace=$PWD" >&2
 

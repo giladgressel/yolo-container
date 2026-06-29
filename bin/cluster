@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# cluster — run SLURM (or any) commands on the BGU login node from inside the
+# yolo container, which has no slurm client of its own.
+#
+# It SSHes to the login node using the forwarded ssh-agent, then runs your
+# command there. Two non-obvious things it handles for you:
+#
+#   1. Agent key pinning. A forwarded agent usually carries several keys; ssh
+#      offers them all and the server aborts with "Too many authentication
+#      failures" before reaching the right one. We extract the one BGU key from
+#      the agent and pass it with IdentitiesOnly=yes so only it is offered.
+#   2. Path translation. The container mounts your project at /workspace, but a
+#      submitted job runs on a GPU node in the *host* NFS filesystem, where
+#      /workspace doesn't exist. We cd to the real NFS path and rewrite any
+#      /workspace/... arg to its NFS equivalent, so job scripts that bake in
+#      $CWD / --output=$CWD/logs/... resolve on the compute node.
+#
+# Usage (run from inside the container):
+#   cluster squeue --me
+#   cluster sacct -j 12345 --format=JobID,State,Elapsed,MaxRSS
+#   cluster scancel 12345
+#   cluster bash batch_submit.sh --gpu pro runs/exp.sh   # from the project dir
+#
+# All cluster-specific values come from the environment, forwarded by bin/yolo
+# from your LOCAL, uncommitted config (~/.config/yolo/cluster.env). Nothing
+# user-specific is baked into this committed script. See cluster.env.example.
+#
+#   YOLO_SLURM_LOGIN  login/submit host     (e.g. slurm.example.edu)   [required]
+#   YOLO_SLURM_USER   your cluster username (ssh runs as uid 0 → root) [required]
+#   YOLO_SLURM_KEY    agent key comment to pin (see `ssh-add -l`)      [required]
+#   YOLO_WS_HOST      real host path that /workspace maps to           [required,
+#                     set automatically by bin/yolo to your launch $PWD]
+#   YOLO_WS_CONTAINER container mount point (default /workspace)
+set -euo pipefail
+
+[ "$#" -ge 1 ] || { echo "usage: cluster <command> [args...]" >&2; exit 2; }
+
+need() {  # require an env var, with a pointer to setup if missing
+  local n="$1"
+  if [ -z "${!n:-}" ]; then
+    echo "cluster: \$$n is not set." >&2
+    echo "  Create ~/.config/yolo/cluster.env (copy cluster.env.example from the" >&2
+    echo "  yolo-container repo, fill in your values), then re-run 'yolo'." >&2
+    exit 1
+  fi
+}
+need YOLO_SLURM_LOGIN; need YOLO_SLURM_USER; need YOLO_SLURM_KEY; need YOLO_WS_HOST
+
+LOGIN="$YOLO_SLURM_LOGIN"
+RUSER="$YOLO_SLURM_USER"
+KEYC="$YOLO_SLURM_KEY"
+WS_C="${YOLO_WS_CONTAINER:-/workspace}"
+WS_H="$YOLO_WS_HOST"
+
+# Preflight: everything here depends on the forwarded ssh-agent. If it's gone
+# (the classic stale case: you reconnected from a different client, or a tmux
+# socket died), ssh fails downstream with a cryptic "error in libcrypto" /
+# "Permission denied". ssh-add -l exits 2 when it can't reach the agent at all.
+agent_rc=0; ssh-add -l >/dev/null 2>&1 || agent_rc=$?
+if [ "$agent_rc" -eq 2 ]; then
+  echo "cluster: can't reach your ssh-agent (SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-unset})." >&2
+  echo "  The forwarded agent died — usually a reconnect from another client or a" >&2
+  echo "  stale tmux socket. Reconnect with agent forwarding (ssh -A / ForwardAgent)," >&2
+  echo "  confirm 'ssh-add -l' lists your key, then re-run 'yolo'. (git push fails the" >&2
+  echo "  same way for the same reason.) See README → SSH agent." >&2
+  exit 1
+fi
+
+# Pin the right agent key (avoids "Too many authentication failures").
+PIN="$HOME/.ssh/bgu_slurm_pin.pub"
+if [ ! -s "$PIN" ]; then
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  if ! ssh-add -L 2>/dev/null | grep -F "$KEYC" > "$PIN"; then
+    rm -f "$PIN"
+    echo "cluster: key '$KEYC' not found in ssh-agent. Run 'ssh-add -l' to check the" >&2
+    echo "         forwarded agent, or set YOLO_SLURM_KEY to the right comment." >&2
+    exit 1
+  fi
+  chmod 600 "$PIN"   # ssh is strict about identity-file perms; 0644 gets rejected
+fi
+
+# Translate container CWD -> NFS host path.
+case "$PWD" in
+  "$WS_C")    rcwd="$WS_H" ;;
+  "$WS_C"/*)  rcwd="$WS_H/${PWD#"$WS_C"/}" ;;
+  *)          rcwd="$WS_H" ;;   # outside the mount: fall back to home
+esac
+
+# Rebuild the command, rewriting /workspace -> NFS path in each arg, quoting for
+# one remote-shell parse. LC_ALL=C silences the remote shell's locale warning
+# (the login node has no en_US.UTF-8 locale generated).
+remote_cmd="export LC_ALL=C LANG=C; cd $(printf '%q' "$rcwd") &&"
+for a in "$@"; do
+  remote_cmd+=" $(printf '%q' "${a//$WS_C/$WS_H}")"
+done
+
+# env LC_ALL=C: ssh forwards LC_*/LANG by default, and the login node's bash
+# warns at startup if the locale isn't generated. Forwarding C (always present)
+# silences it before our remote command even runs.
+exec env LC_ALL=C LANG=C ssh -i "$PIN" -o IdentitiesOnly=yes \
+     -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=15 \
+     "$RUSER@$LOGIN" "$remote_cmd"

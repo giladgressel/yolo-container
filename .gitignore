@@ -1,3 +1,8 @@
 # Runtime artifact: "over-the-wall" files the container writes when it wants to
 # propose a change to host config. User picks them up with cp; nothing to commit.
 _yolo_outbox/
+
+# Personal SLURM-from-container config belongs in ~/.config/yolo/cluster.env, but
+# if anyone keeps a copy in the repo tree, never commit it (it's per-user).
+cluster.env
+*.cluster.env
