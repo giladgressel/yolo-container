@@ -81,6 +81,20 @@ file lives outside the repo and survives across branches. Because `/tmp` is
 node-local, the first `yolo` run on each new node rebuilds the image (a few
 minutes).
 
+`~/.config/containers/containers.conf` pins libpod's runtime/tmp dir to the
+same node-local `/tmp/podman-gressel/run/libpod/tmp` (`[engine] tmp_dir`) and
+sets `events_logger = "file"`. By default rootless podman keeps its transient
+state (events dir, locks) under `$XDG_RUNTIME_DIR`, falling back to
+`/run/user/$UID`. A compute node you SSH into usually has no systemd-logind
+session, so `/run/user/$UID` doesn't exist and `/run/user` is root-owned —
+podman then dies at startup with `creating events dirs: mkdir /run/user/$UID:
+permission denied`. It's also sticky: podman caches that path in `db.sql` on
+first init, so if you ever run it *with* a login session (e.g. inside an
+interactive job), the cached path goes stale the instant that session ends and
+keeps breaking later runs. If you hit the stale-path error after this config is
+in place, clear the libpod DB once: `mv /tmp/podman-gressel/storage/db.sql{,.old}`
+(keeps images — those live in c/storage, not `db.sql`).
+
 ## Verified on this node
 
 - Image builds clean end to end (`podman build .devcontainer/`).
