@@ -34,6 +34,13 @@ ln -s ~/code/yolo-container/bin/yolo ~/.local/bin/yolo
 First time you run `yolo` it builds the image (a few minutes). After that,
 launches are instant.
 
+**Compute-node use needs a one-time podman config.** Rootless podman assumes a
+systemd login session that SSH-adopted compute-node sessions don't have, so
+`yolo` fails to build there until you add two small files under
+`~/.config/containers/`. Hand this README's *Rootless podman on compute nodes*
+section (below the divider) to Claude and it'll write them for you — they're
+per-user and `~/.config` is NFS-shared, so it's a ~30-second one-time step.
+
 ### Daily use — login node
 
 Quick and dirty, no GPU:
@@ -142,6 +149,61 @@ This branch uses **rootless `podman`** (preinstalled on the cluster). The
 `yolo` wrapper calls `$YOLO_ENGINE` which defaults to `podman`; set
 `YOLO_ENGINE=docker` to use docker instead if you somehow have it. All
 semantics are the same: `podman run`, `podman build`, `podman volume ls`.
+
+### Rootless podman on compute nodes (per-user config, required)
+
+Rootless podman's defaults assume a **systemd-logind user session**: it keeps
+transient state under `/run/user/$UID`, logs events to `journald`, and drives
+cgroup setup through `systemd`/`sd-bus`. When you SSH into a SLURM compute node,
+`pam_slurm_adopt` drops you into the job's cgroup but gives you **no logind
+session** — so every one of those defaults fails. You must supply per-user
+config under `~/.config/containers/`. These files are **not in this repo**:
+they're personal (they carry your username and node-local `/tmp` paths).
+`~/.config` is NFS-shared, so you write them once and they apply on every node.
+
+Two files. Replace `gressel` with your own username throughout.
+
+`~/.config/containers/storage.conf` — keep images off NFS (the overlay driver
+needs xattrs NFS can't do; `/tmp` is node-local xfs):
+
+```toml
+[storage]
+driver = "overlay"
+graphroot = "/tmp/podman-gressel/storage"
+runroot = "/tmp/podman-gressel/runroot"
+
+[storage.options.overlay]
+# No subuid/subgid ranges (cluster AD identity) → single-UID mapping; let
+# overlay fall back to our uid when a layer's chown fails, instead of aborting.
+ignore_chown_errors = "true"
+```
+
+`~/.config/containers/containers.conf` — strip the three logind dependencies:
+
+```toml
+[engine]
+# Default transient dir is /run/user/$UID (logind-created, absent here).
+tmp_dir = "/tmp/podman-gressel/run/libpod/tmp"
+# Default events logger "journald" needs a user systemd session.
+events_logger = "file"
+# Default cgroup manager "systemd" drives cgroups via sd-bus (user D-Bus);
+# without it crun fails at container-create with
+# "sd-bus call: Interactive authentication required". cgroupfs writes cgroups
+# directly, no D-Bus. Harmless on nodes that DO have systemd too.
+cgroup_manager = "cgroupfs"
+```
+
+Symptoms when these are missing/incomplete, roughly in the order you hit them:
+
+| Error | Missing setting |
+|---|---|
+| `creating events dirs: mkdir /run/user/$UID: permission denied` | `tmp_dir` |
+| image-layer writes fail on NFS / overlay xattr errors | `storage.conf` graphroot on `/tmp` |
+| `sd-bus call: Interactive authentication required` at a `RUN`/create step | `cgroup_manager = "cgroupfs"` |
+
+Caveat (also noted in `storage.conf`): `/tmp` is node-local, so the built image
+doesn't carry across nodes — the first `yolo` on each new node rebuilds (a few
+minutes). Everything after that on the same node is instant.
 
 ### Single-UID mode — the container runs as root
 

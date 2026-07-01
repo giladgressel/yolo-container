@@ -31,6 +31,18 @@ cluster scancel <id>
   confirm `ssh-add -l` lists your key, then re-run `yolo`. `cluster` now
   preflights this and prints a clear message.
 
+## Rootless podman on compute nodes (added 2026-07-01)
+
+`yolo`'s build/run fails on a fresh compute node until the user has per-user
+`~/.config/containers/{storage.conf,containers.conf}` — SSH-adopted
+compute-node sessions have no systemd-logind session, so podman's default
+`/run/user/$UID` state dir, `journald` events logger, and `systemd` cgroup
+manager all fail. The tell-tale: `sd-bus call: Interactive authentication
+required` at a `RUN`/create step (missing `cgroup_manager = "cgroupfs"`), or
+`mkdir /run/user/$UID: permission denied` (missing `tmp_dir`). Full explanation
++ the exact file contents are in README → **Rootless podman on compute nodes**.
+`~/.config` is NFS-shared, so writing them once covers every node.
+
 ## Orchestrator-on-CPU
 
 `~/start_claude_cpu.sh` (lives in the user's home, not this repo) holds a CPU
