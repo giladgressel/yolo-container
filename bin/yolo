@@ -42,6 +42,33 @@ if ! command -v "$ENGINE" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Persistent per-user state on NFS ($HOME is NFS-shared across all nodes).
+# Podman named volumes live inside the graphroot, which storage.conf puts on
+# node-local /tmp (the overlay driver can't run on NFS) — so anything kept in
+# a named volume silently dies on a node hop. Claude login/sessions and shell
+# history must survive node changes, so they're plain bind mounts under $HOME
+# instead. uv caches stay in named volumes on purpose: they're pure caches
+# (cheap to refill) and uv hardlinks out of them, which NFS handles poorly.
+STATE_DIR="${YOLO_STATE_DIR:-$HOME/.local/state/yolo}"
+mkdir -p "$STATE_DIR/claude" "$STATE_DIR/bashhistory"
+
+# Image cache on NFS: podman's image store is node-local /tmp (see above), so
+# a fresh node has no image. A `podman save` tarball on NFS turns "rebuild
+# from scratch + network pulls (~minutes)" into "podman load (~1 min)".
+# Best-effort: a failed save (disk quota, …) never blocks the run.
+# YOLO_IMAGE_CACHE=0 disables both save and load.
+IMAGE_TAR="$STATE_DIR/yolo-claude-image.tar"
+save_image() {
+  [ "${YOLO_IMAGE_CACHE:-1}" = "1" ] || return 0
+  echo "yolo: caching image to $IMAGE_TAR (fast reuse on other nodes)..." >&2
+  if "$ENGINE" save -o "$IMAGE_TAR.tmp" "$IMAGE" && mv "$IMAGE_TAR.tmp" "$IMAGE_TAR"; then
+    :
+  else
+    rm -f "$IMAGE_TAR.tmp"
+    echo "yolo: warning — couldn't cache image to NFS (quota?); new nodes will rebuild" >&2
+  fi
+}
+
 # `yolo --update` (aliases: --rebuild, -u): rebuild the image from scratch so the
 # baked-in Claude Code CLI tracks the current @latest, then exit. The Dockerfile
 # pins @latest, but that's a constant string, so an ordinary rebuild hits the
@@ -50,6 +77,7 @@ fi
 if [ "${1:-}" = "--update" ] || [ "${1:-}" = "--rebuild" ] || [ "${1:-}" = "-u" ]; then
   echo "yolo: rebuilding $IMAGE from scratch (pulls latest Claude Code; a few minutes)..." >&2
   "$ENGINE" build --pull --no-cache -t "$IMAGE" "$CTX"
+  save_image
   printf 'yolo: done. Claude Code in image is now: ' >&2
   "$ENGINE" run --rm --entrypoint /usr/local/share/npm-global/bin/claude "$IMAGE" --version 2>/dev/null \
     || echo "(version check failed)" >&2
@@ -57,9 +85,33 @@ if [ "${1:-}" = "--update" ] || [ "${1:-}" = "--rebuild" ] || [ "${1:-}" = "-u" 
 fi
 
 if ! "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
-  echo "yolo: building $IMAGE (first run — a few minutes)..." >&2
-  "$ENGINE" build -t "$IMAGE" "$CTX"
+  if [ "${YOLO_IMAGE_CACHE:-1}" = "1" ] && [ -f "$IMAGE_TAR" ]; then
+    echo "yolo: image not on this node — loading cached tarball from NFS (~1 min)..." >&2
+    if ! "$ENGINE" load -i "$IMAGE_TAR"; then
+      echo "yolo: load failed — building instead..." >&2
+      "$ENGINE" build -t "$IMAGE" "$CTX"
+      save_image
+    fi
+  else
+    echo "yolo: building $IMAGE (first run — a few minutes)..." >&2
+    "$ENGINE" build -t "$IMAGE" "$CTX"
+    save_image
+  fi
 fi
+
+# One-time migration: adopt state from the old node-local named volumes if the
+# NFS dirs are still empty and the volumes exist on this node.
+migrate_volume() {
+  local vol="$1" dest="$2" mp
+  [ -n "$(ls -A "$dest" 2>/dev/null)" ] && return 0
+  "$ENGINE" volume inspect "$vol" >/dev/null 2>&1 || return 0
+  mp=$("$ENGINE" volume inspect --format '{{.Mountpoint}}' "$vol" 2>/dev/null) || return 0
+  [ -d "$mp" ] || return 0
+  cp -a "$mp/." "$dest/" 2>/dev/null || true
+  echo "yolo: migrated $vol (node-local volume) -> $dest" >&2
+}
+migrate_volume yolo-claude-config "$STATE_DIR/claude"
+migrate_volume yolo-bashhistory  "$STATE_DIR/bashhistory"
 
 args=(
   --rm -it
@@ -71,8 +123,10 @@ args=(
   -v /workspace/.venv
   -v yolo-uv-cache:/home/node/.cache/uv
   -v yolo-uv-data:/home/node/.local/share/uv
-  -v yolo-claude-config:/home/node/.claude
-  -v yolo-bashhistory:/commandhistory
+  # NFS bind mounts, NOT named volumes — must survive node hops (see STATE_DIR
+  # comment above). claude/ holds login, .claude.json, and all sessions.
+  -v "$STATE_DIR/claude:/home/node/.claude"
+  -v "$STATE_DIR/bashhistory:/commandhistory"
   -e CLAUDE_CONFIG_DIR=/home/node/.claude
   # Single-UID mode forces the container to run as root (uid 0), and Claude
   # refuses `--dangerously-skip-permissions` as root unless it knows it's

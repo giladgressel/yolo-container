@@ -31,6 +31,21 @@ cluster scancel <id>
   confirm `ssh-add -l` lists your key, then re-run `yolo`. `cluster` now
   preflights this and prints a clear message.
 
+## State that must survive node hops lives on NFS (added 2026-07-04)
+
+Podman's graphroot is on node-local `/tmp` (overlay can't run on NFS), and
+**named volumes live inside the graphroot** — so a named volume is silently
+node-local on this cluster. Anything that must survive moving to another node
+is therefore an NFS bind mount under `~/.local/state/yolo/` (override:
+`YOLO_STATE_DIR`): `claude/` (login + `.claude.json` + sessions → mounted at
+`/home/node/.claude`) and `bashhistory/`. The image is cached as a
+`podman save` tarball at `~/.local/state/yolo/yolo-claude-image.tar` — new
+nodes `podman load` it (~1 min) instead of rebuilding; `yolo --update` and
+first builds refresh it (`YOLO_IMAGE_CACHE=0` disables). uv caches stay in
+named volumes on purpose (pure caches; uv hardlinks don't play well with NFS).
+After editing the Dockerfile, `rm` the tarball too or the next node loads the
+stale image (README → "Common tasks").
+
 ## Rootless podman on compute nodes (added 2026-07-01)
 
 `yolo`'s build/run fails on a fresh compute node until the user has per-user

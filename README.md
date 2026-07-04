@@ -201,9 +201,17 @@ Symptoms when these are missing/incomplete, roughly in the order you hit them:
 | image-layer writes fail on NFS / overlay xattr errors | `storage.conf` graphroot on `/tmp` |
 | `sd-bus call: Interactive authentication required` at a `RUN`/create step | `cgroup_manager = "cgroupfs"` |
 
-Caveat (also noted in `storage.conf`): `/tmp` is node-local, so the built image
-doesn't carry across nodes — the first `yolo` on each new node rebuilds (a few
-minutes). Everything after that on the same node is instant.
+Caveat (also noted in `storage.conf`): `/tmp` is node-local, so podman's image
+store doesn't carry across nodes. To avoid a full rebuild per node, `yolo`
+keeps a `podman save` tarball of the image on NFS
+(`~/.local/state/yolo/yolo-claude-image.tar`, refreshed after every build):
+the first `yolo` on a new node does a `podman load` (~1 min) instead of
+rebuilding (~minutes + network). Set `YOLO_IMAGE_CACHE=0` to disable.
+Everything after that on the same node is instant.
+
+Same trap, different data: podman **named volumes** also live inside the
+node-local graphroot. That's why Claude login/sessions/history now use NFS
+bind mounts instead — see "Persistent state" below.
 
 ### Single-UID mode — the container runs as root
 
@@ -350,7 +358,7 @@ fi
 A *running* container's mount is pinned at launch, so switching clients
 still means **re-running yolo** (the container restart) to pick up the new
 socket — the symlink just makes that a clean restart, and `claude --resume`
-brings the session back (history lives in the `yolo-claude-config` volume,
+brings the session back (state lives in `~/.local/state/yolo/claude` on NFS,
 not the container). Caveat: `~/.ssh` is NFS-shared but agent sockets are
 node-local, so this one symlink is owned by whichever node you last
 connected from — correct for one-node-at-a-time use, but two concurrent
@@ -569,17 +577,31 @@ choice consistent with the already-open radius (the agent can already submit job
 as you); it's `chmod 600` and revocable on its own. Not doing per-repo deploy
 keys — an account-wide key is fine here. Revisit only if the threat model changes.
 
-### Persistent state (named podman volumes)
+### Persistent state
 
-| Volume | Holds |
-|---|---|
-| `yolo-claude-config` | `/home/node/.claude` — Claude login, runtime state |
-| `yolo-uv-cache` | `/home/node/.cache/uv` — uv's package cache, shared across projects |
-| `yolo-uv-data` | `/home/node/.local/share/uv` — uv-managed Python interpreters, so uv doesn't re-download CPython every run |
-| `yolo-bashhistory` | zsh/bash history across sessions |
-| anonymous (per-run) | `/workspace/.venv` — container's Linux venv, isolated from host's venv at the same path (glibc mismatch between RHEL9 host and Debian container) |
+Two tiers, split by whether the data must **survive a node hop**. Named podman
+volumes live inside the graphroot, which is on node-local `/tmp` on this
+cluster (see "Rootless podman on compute nodes") — so anything that must
+follow you across nodes is an **NFS bind mount** under
+`~/.local/state/yolo/` (override with `YOLO_STATE_DIR`) instead:
 
-List: `podman volume ls | grep yolo`. Nuke one: `podman volume rm <name>`.
+| Kind | Location | Holds |
+|---|---|---|
+| NFS bind mount | `~/.local/state/yolo/claude` → `/home/node/.claude` | Claude login (OAuth creds), `.claude.json`, **all sessions** — survives node hops |
+| NFS bind mount | `~/.local/state/yolo/bashhistory` → `/commandhistory` | zsh/bash history across sessions and nodes |
+| NFS file | `~/.local/state/yolo/yolo-claude-image.tar` | `podman save` image cache — new nodes `podman load` instead of rebuilding |
+| named volume (node-local) | `yolo-uv-cache` → `/home/node/.cache/uv` | uv package cache — a pure cache, refills itself; uv hardlinks out of it, which NFS handles poorly |
+| named volume (node-local) | `yolo-uv-data` → `/home/node/.local/share/uv` | uv-managed CPython interpreters — also just re-downloads on a new node |
+| anonymous (per-run) | `/workspace/.venv` | container's Linux venv, isolated from host's venv at the same path (glibc mismatch between RHEL9 host and Debian container) |
+
+On first run after this change, `yolo` migrates the contents of the old
+`yolo-claude-config` / `yolo-bashhistory` volumes into the NFS dirs (only if
+the NFS dir is empty and the volume exists on that node).
+
+Caveat: one shared `~/.local/state/yolo/claude` means **concurrent yolo
+containers on different nodes share Claude state**. Sessions are per-session
+files, so they coexist fine, but concurrent writes to `.claude.json` (e.g.
+changing settings in two containers at once) are last-writer-wins.
 
 ### Sandbox guarantees
 
@@ -601,7 +623,8 @@ List: `podman volume ls | grep yolo`. Nuke one: `podman volume rm <name>`.
 **Rebuild the image** (after editing Dockerfile):
 ```sh
 podman rmi yolo-claude:latest
-yolo   # next run rebuilds
+rm -f ~/.local/state/yolo/yolo-claude-image.tar   # else next yolo loads the stale cache
+yolo   # next run rebuilds (and re-caches)
 ```
 
 **Update Claude Code to latest:**
@@ -617,13 +640,14 @@ yolo` also works but doesn't `--no-cache`, so it can keep a cached CLI.)
 
 **Force re-login to Claude:**
 ```sh
-podman volume rm yolo-claude-config
+rm -rf ~/.local/state/yolo/claude
 ```
 
 **Nuke everything** (login, history, cache — full reset):
 ```sh
 podman rmi yolo-claude:latest
-podman volume rm yolo-claude-config yolo-uv-cache yolo-uv-data yolo-bashhistory
+podman volume rm yolo-uv-cache yolo-uv-data
+rm -rf ~/.local/state/yolo
 yolo
 ```
 
