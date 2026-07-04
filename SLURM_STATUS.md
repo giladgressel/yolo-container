@@ -109,8 +109,12 @@ in place, clear the libpod DB once: `mv /tmp/podman-gressel/storage/db.sql{,.old
 - Other GPU node types / driver lib locations (here they're `/usr/lib64/`).
 - CDI path (`--device nvidia.com/gpu=all`) is untested — this node has no
   `nvidia-ctk`, so `yolo` falls back to raw-device mode. Fine as is.
-- SLURM-from-inside-container is still deliberately not wired; ssh back to the
-  login node via the forwarded agent if Claude needs `squeue`/`sbatch`.
+- SLURM-from-inside-container is wired via the **`cluster`** helper
+  (`bin/cluster`): it ssh'es to the login node and runs slurm there — no slurm
+  client, munge, or slurm.conf in the image. Authenticates with the forwarded
+  ssh-agent, or with a server-resident key (`YOLO_SLURM_KEYFILE`) that keeps it
+  working while the laptop is detached. See README → "SLURM from inside the
+  container" and "Server-resident SSH key".
 
 ---
 

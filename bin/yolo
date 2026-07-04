@@ -322,6 +322,22 @@ for v in YOLO_SLURM_LOGIN YOLO_SLURM_USER YOLO_SLURM_KEY YOLO_WS_CONTAINER; do
   [ -n "${!v:-}" ] && args+=(-e "$v=${!v}")
 done
 
+# Server-resident SSH key (optional). A passphrase-less key that lives on the
+# cluster so `cluster` and `git push` keep working when the laptop — and the
+# forwarded ssh-agent it carries — is detached. YOLO_SLURM_KEYFILE in cluster.env
+# is the HOST path; we mount it read-only at a fixed container path and forward
+# THAT path, so `cluster` and the in-container git config both find it. The key's
+# host perms (0600) carry through the read-only mount, which ssh requires.
+if [ -n "${YOLO_SLURM_KEYFILE:-}" ]; then
+  if [ -f "$YOLO_SLURM_KEYFILE" ]; then
+    add_ro "$YOLO_SLURM_KEYFILE" /home/node/.ssh/yolo_server
+    args+=(-e "YOLO_SLURM_KEYFILE=/home/node/.ssh/yolo_server")
+  else
+    echo "yolo: warning — YOLO_SLURM_KEYFILE=$YOLO_SLURM_KEYFILE not found; skipping" >&2
+    echo "yolo:   the server-key mount. cluster/git will fall back to the ssh-agent." >&2
+  fi
+fi
+
 echo "yolo: engine=$ENGINE gpu=$gpu_mode workspace=$PWD" >&2
 
 exec "$ENGINE" run "${args[@]}" "$IMAGE" \
@@ -341,6 +357,19 @@ exec "$ENGINE" run "${args[@]}" "$IMAGE" \
       fi
       count=$(echo "$host_mcps" | jq "keys | length")
       echo "yolo: synced $count MCP server(s) from host -> $target"
+    fi
+
+    # Server-resident SSH key: make git push use it for github.com. A per-host
+    # ssh_config block (not GIT_SSH_COMMAND) so only github.com is pinned to this
+    # key; any other ssh still falls through to the forwarded agent when present.
+    # Requires the remote to be the SSH form git@github.com:owner/repo.git.
+    if [ -n "${YOLO_SLURM_KEYFILE:-}" ] && [ -f "$YOLO_SLURM_KEYFILE" ]; then
+      mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      if ! grep -q "yolo_server" ~/.ssh/config 2>/dev/null; then
+        printf "Host github.com\n  IdentityFile %s\n  IdentitiesOnly yes\n" \
+          "$YOLO_SLURM_KEYFILE" >> ~/.ssh/config
+        chmod 600 ~/.ssh/config
+      fi
     fi
 
     # Python project: sync deps into container-local .venv (anonymous volume)

@@ -27,7 +27,13 @@
 #
 #   YOLO_SLURM_LOGIN  login/submit host     (e.g. slurm.example.edu)   [required]
 #   YOLO_SLURM_USER   your cluster username (ssh runs as uid 0 → root) [required]
-#   YOLO_SLURM_KEY    agent key comment to pin (see `ssh-add -l`)      [required]
+#   YOLO_SLURM_KEYFILE in-container path to a server-resident private key. If set,
+#                     we use it directly (ssh -i … -o IdentitiesOnly=yes) and skip
+#                     the ssh-agent entirely — this is what lets `cluster` keep
+#                     working when the laptop (and its forwarded agent) is gone.
+#                     Takes precedence over YOLO_SLURM_KEY.       [preferred]
+#   YOLO_SLURM_KEY    agent key comment to pin (see `ssh-add -l`). Used only in
+#                     the forwarded-agent fallback (no keyfile).  [agent mode]
 #   YOLO_WS_HOST      real host path that /workspace maps to           [required,
 #                     set automatically by bin/yolo to your launch $PWD]
 #   YOLO_WS_CONTAINER container mount point (default /workspace)
@@ -44,39 +50,59 @@ need() {  # require an env var, with a pointer to setup if missing
     exit 1
   fi
 }
-need YOLO_SLURM_LOGIN; need YOLO_SLURM_USER; need YOLO_SLURM_KEY; need YOLO_WS_HOST
+need YOLO_SLURM_LOGIN; need YOLO_SLURM_USER; need YOLO_WS_HOST
 
 LOGIN="$YOLO_SLURM_LOGIN"
 RUSER="$YOLO_SLURM_USER"
-KEYC="$YOLO_SLURM_KEY"
 WS_C="${YOLO_WS_CONTAINER:-/workspace}"
 WS_H="$YOLO_WS_HOST"
 
-# Preflight: everything here depends on the forwarded ssh-agent. If it's gone
-# (the classic stale case: you reconnected from a different client, or a tmux
-# socket died), ssh fails downstream with a cryptic "error in libcrypto" /
-# "Permission denied". ssh-add -l exits 2 when it can't reach the agent at all.
-agent_rc=0; ssh-add -l >/dev/null 2>&1 || agent_rc=$?
-if [ "$agent_rc" -eq 2 ]; then
-  echo "cluster: can't reach your ssh-agent (SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-unset})." >&2
-  echo "  The forwarded agent died — usually a reconnect from another client or a" >&2
-  echo "  stale tmux socket. Reconnect with agent forwarding (ssh -A / ForwardAgent)," >&2
-  echo "  confirm 'ssh-add -l' lists your key, then re-run 'yolo'. (git push fails the" >&2
-  echo "  same way for the same reason.) See README → SSH agent." >&2
-  exit 1
-fi
-
-# Pin the right agent key (avoids "Too many authentication failures").
-PIN="$HOME/.ssh/bgu_slurm_pin.pub"
-if [ ! -s "$PIN" ]; then
-  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-  if ! ssh-add -L 2>/dev/null | grep -F "$KEYC" > "$PIN"; then
-    rm -f "$PIN"
-    echo "cluster: key '$KEYC' not found in ssh-agent. Run 'ssh-add -l' to check the" >&2
-    echo "         forwarded agent, or set YOLO_SLURM_KEY to the right comment." >&2
+# Pick the identity. Two modes:
+#   keyfile — a server-resident private key mounted into the container. Preferred:
+#     it needs no ssh-agent, so `cluster` keeps working when the laptop (and its
+#     forwarded agent) is detached. bin/yolo sets YOLO_SLURM_KEYFILE to the
+#     in-container key path when the key is configured.
+#   agent  — fallback for the connected case: pin one key out of the forwarded
+#     ssh-agent and offer only it (avoids "Too many authentication failures").
+if [ -n "${YOLO_SLURM_KEYFILE:-}" ]; then
+  if [ ! -f "$YOLO_SLURM_KEYFILE" ]; then
+    echo "cluster: YOLO_SLURM_KEYFILE=$YOLO_SLURM_KEYFILE does not exist inside the" >&2
+    echo "         container. Check the key mount in bin/yolo, then re-run 'yolo'." >&2
     exit 1
   fi
-  chmod 600 "$PIN"   # ssh is strict about identity-file perms; 0644 gets rejected
+  SSH_KEY="$YOLO_SLURM_KEYFILE"
+else
+  need YOLO_SLURM_KEY
+  KEYC="$YOLO_SLURM_KEY"
+
+  # Preflight: the agent path depends on the forwarded ssh-agent. If it's gone
+  # (the classic stale case: you reconnected from a different client, or a tmux
+  # socket died), ssh fails downstream with a cryptic "error in libcrypto" /
+  # "Permission denied". ssh-add -l exits 2 when it can't reach the agent at all.
+  agent_rc=0; ssh-add -l >/dev/null 2>&1 || agent_rc=$?
+  if [ "$agent_rc" -eq 2 ]; then
+    echo "cluster: can't reach your ssh-agent (SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-unset})." >&2
+    echo "  The forwarded agent died — usually a reconnect from another client or a" >&2
+    echo "  stale tmux socket. Reconnect with agent forwarding (ssh -A / ForwardAgent)," >&2
+    echo "  confirm 'ssh-add -l' lists your key, then re-run 'yolo'. (git push fails the" >&2
+    echo "  same way for the same reason.) See README → SSH agent. Or configure a" >&2
+    echo "  server-resident key (YOLO_SLURM_KEYFILE) to drop the agent dependency." >&2
+    exit 1
+  fi
+
+  # Pin the right agent key (avoids "Too many authentication failures").
+  PIN="$HOME/.ssh/bgu_slurm_pin.pub"
+  if [ ! -s "$PIN" ]; then
+    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+    if ! ssh-add -L 2>/dev/null | grep -F "$KEYC" > "$PIN"; then
+      rm -f "$PIN"
+      echo "cluster: key '$KEYC' not found in ssh-agent. Run 'ssh-add -l' to check the" >&2
+      echo "         forwarded agent, or set YOLO_SLURM_KEY to the right comment." >&2
+      exit 1
+    fi
+    chmod 600 "$PIN"   # ssh is strict about identity-file perms; 0644 gets rejected
+  fi
+  SSH_KEY="$PIN"
 fi
 
 # Translate container CWD -> NFS host path.
@@ -97,6 +123,6 @@ done
 # env LC_ALL=C: ssh forwards LC_*/LANG by default, and the login node's bash
 # warns at startup if the locale isn't generated. Forwarding C (always present)
 # silences it before our remote command even runs.
-exec env LC_ALL=C LANG=C ssh -i "$PIN" -o IdentitiesOnly=yes \
+exec env LC_ALL=C LANG=C ssh -i "$SSH_KEY" -o IdentitiesOnly=yes \
      -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=15 \
      "$RUSER@$LOGIN" "$remote_cmd"

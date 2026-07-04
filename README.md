@@ -524,6 +524,51 @@ from the login and compute nodes — the normal HPC case.
 > of the munge-uid-under-single-UID-userns unknown; the ssh path is simpler and
 > proven.
 
+### Server-resident SSH key (detached operation)
+
+By default `cluster` and `git push` authenticate with your **forwarded
+ssh-agent**. That agent is borrowed from your laptop, so it dies the moment the
+laptop detaches (lid closes, tmux reattached from another client) — and no
+forwarding scheme can fix that, because a forwarded agent is *defined* by the
+laptop being present. If you want the agent to keep managing jobs and pushing
+while you're disconnected, give the cluster **its own** key.
+
+Generate one passphrase-less key **on the cluster** (born there, so the private
+half never crosses the network; revocable independently of your laptop keys) and
+register its public half in two places — `authorized_keys` (compute→login ssh
+for slurm; NFS home covers both nodes) and GitHub (push):
+
+```sh
+# On the cluster login/compute node — NOT inside the container:
+ssh-keygen -t ed25519 -f ~/.ssh/yolo_server -N "" -C "yolo-server-$(hostname)"
+chmod 600 ~/.ssh/yolo_server
+
+cat ~/.ssh/yolo_server.pub >> ~/.ssh/authorized_keys   # compute -> login ssh
+chmod 600 ~/.ssh/authorized_keys
+
+# GitHub: paste ~/.ssh/yolo_server.pub at Settings -> SSH keys, or `gh ssh-key add`
+```
+
+Then point your config at it and re-run `yolo`:
+
+```sh
+echo 'YOLO_SLURM_KEYFILE=~/.ssh/yolo_server' >> ~/.config/yolo/cluster.env
+```
+
+`bin/yolo` mounts that key read-only into the container and forwards its path;
+`cluster` then uses `ssh -i … -o IdentitiesOnly=yes` and **skips the ssh-agent
+entirely** (`YOLO_SLURM_KEYFILE` takes precedence over `YOLO_SLURM_KEY`), and an
+in-container `~/.ssh/config` block pins `github.com` to the same key so `git
+push` works too (remote must be the SSH form `git@github.com:owner/repo.git`).
+When the keyfile is absent, everything falls back to the forwarded-agent path, so
+the connected case is unchanged.
+
+*Trade-off:* a passphrase-less key on the server is a standing credential inside
+the container's blast radius, usable when nobody's watching. That's a deliberate
+choice consistent with the already-open radius (the agent can already submit jobs
+as you); it's `chmod 600` and revocable on its own. Not doing per-repo deploy
+keys — an account-wide key is fine here. Revisit only if the threat model changes.
+
 ### Persistent state (named podman volumes)
 
 | Volume | Holds |
