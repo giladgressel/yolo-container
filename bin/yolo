@@ -97,6 +97,13 @@ if ! "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
     "$ENGINE" build -t "$IMAGE" "$CTX"
     save_image
   fi
+elif [ "${YOLO_IMAGE_CACHE:-1}" = "1" ] && [ ! -f "$IMAGE_TAR" ]; then
+  # The image is already on this node but the NFS tarball is missing — e.g. this
+  # image predates the cache, or it was built on a node that never seeded NFS.
+  # save_image only runs on a from-scratch build/--update, so without this a
+  # node that already has the image never primes the cache, and the NEXT node
+  # hop pays a full rebuild. Seed it now so that hop can just `podman load`.
+  save_image
 fi
 
 # One-time migration: adopt state from the old node-local named volumes if the
